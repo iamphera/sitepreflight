@@ -33,7 +33,11 @@ export function parseRobots(txt) {
 // Mojibake: UTF-8 bytes that were decoded as latin-1 somewhere upstream. The
 // giveaway is the Â/â/Ã prefixes, which almost never appear in real English copy.
 export function findMojibake(html) {
-  const hits = [...html.matchAll(/[ÂÃâ][-¿ -›]/g)].map(m => m[0]);
+  // Code samples are skipped — a page documenting mojibake will contain it on purpose.
+  const prose = html
+    .replace(/<(code|pre|script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ');
+  const hits = [...prose.matchAll(/[ÂÃâ][-¿ -›]/g)].map(m => m[0]);
   return [...new Set(hits)];
 }
 
@@ -208,6 +212,7 @@ function selftest() {
 
   assert(findMojibake('cafÃ© naÃ¯ve').length > 0, 'mojibake detected');
   assert(findMojibake('café naïve — clean copy').length === 0, 'clean text is not mojibake');
+  assert(findMojibake('<code>cafÃ©</code> is what mojibake looks like').length === 0, 'code samples exempt from mojibake');
 
   const good = `<title>T</title><meta name="description" content="d">
     <link rel="canonical" href="https://a.com/p/"><meta name="robots" content="index,follow">`;
