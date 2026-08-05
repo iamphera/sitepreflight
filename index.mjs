@@ -1,0 +1,260 @@
+#!/usr/bin/env node
+// sitepreflight — pre-flight checks for a static site, then tell the search engines.
+// Zero dependencies. Node 18+.
+//
+//   sitepreflight check https://example.com [--limit N] [--json]
+//   sitepreflight submit https://example.com/page/ ... --key <indexnow-key>
+//
+// Exit code is 1 when any check fails, so it works as a CI gate.
+
+const UA = 'sitepreflight/0.1 (+https://github.com/iamphera/sitepreflight)';
+
+// ---------- pure helpers (covered by --selftest) ----------
+
+export function parseSitemap(xml) {
+  return [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map(m => m[1]);
+}
+
+export function parseRobots(txt) {
+  const lines = txt.split('\n').map(l => l.replace(/#.*/, '').trim()).filter(Boolean);
+  const sitemaps = [];
+  let star = false, blocksAll = false;
+  for (const line of lines) {
+    const [rawKey, ...rest] = line.split(':');
+    const key = rawKey.toLowerCase().trim();
+    const value = rest.join(':').trim();
+    if (key === 'sitemap') sitemaps.push(value);
+    else if (key === 'user-agent') star = value === '*';
+    else if (key === 'disallow' && star && value === '/') blocksAll = true;
+  }
+  return { sitemaps, blocksAll };
+}
+
+// Mojibake: UTF-8 bytes that were decoded as latin-1 somewhere upstream. The
+// giveaway is the Â/â/Ã prefixes, which almost never appear in real English copy.
+export function findMojibake(html) {
+  const hits = [...html.matchAll(/[ÂÃâ][-¿ -›]/g)].map(m => m[0]);
+  return [...new Set(hits)];
+}
+
+export function checkHtml(html, url) {
+  const problems = [];
+  const pick = re => (html.match(re) || [])[1];
+
+  const title = pick(/<title[^>]*>([^<]*)<\/title>/i);
+  if (!title || !title.trim()) problems.push('no <title>');
+
+  const robots = pick(/<meta[^>]+name=["']robots["'][^>]*content=["']([^"']+)["']/i) || '';
+  if (/noindex/i.test(robots)) problems.push(`meta robots says noindex ("${robots}")`);
+
+  const canonical = pick(/<link[^>]+rel=["']canonical["'][^>]*href=["']([^"']+)["']/i);
+  if (!canonical) problems.push('no rel=canonical');
+  else if (normalise(canonical) !== normalise(url)) problems.push(`canonical points elsewhere (${canonical})`);
+
+  const desc = pick(/<meta[^>]+name=["']description["'][^>]*content=["']([^"']*)["']/i);
+  if (!desc || !desc.trim()) problems.push('no meta description');
+
+  const mojibake = findMojibake(html);
+  if (mojibake.length) problems.push(`mojibake: ${mojibake.slice(0, 4).join(' ')}`);
+
+  return { title, problems };
+}
+
+function normalise(u) {
+  try {
+    const p = new URL(u);
+    return (p.origin + p.pathname).replace(/\/+$/, '') || p.origin;
+  } catch { return u; }
+}
+
+export function internalLinks(html, base) {
+  const hrefs = [...html.matchAll(/<a[^>]+href=["']([^"'#]+)["']/gi)].map(m => m[1]);
+  const out = new Set();
+  for (const h of hrefs) {
+    let abs;
+    try { abs = new URL(h, base); } catch { continue; }
+    if (abs.origin !== new URL(base).origin) continue;
+    if (/\.(png|jpe?g|gif|svg|webp|ico|css|js|pdf|xml|txt)$/i.test(abs.pathname)) continue;
+    out.add(abs.origin + abs.pathname);
+  }
+  return [...out];
+}
+
+// ---------- network ----------
+
+async function get(url, method = 'GET') {
+  try {
+    const res = await fetch(url, { method, headers: { 'user-agent': UA }, redirect: 'follow' });
+    const body = method === 'GET' ? await res.text() : '';
+    return { status: res.status, body, url: res.url };
+  } catch (err) {
+    return { status: 0, body: '', url, error: err.message };
+  }
+}
+
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) {
+      const n = i++;
+      out[n] = await fn(items[n], n);
+    }
+  }));
+  return out;
+}
+
+// ---------- commands ----------
+
+async function check(base, { limit, json }) {
+  const origin = new URL(base).origin;
+  const report = { site: origin, pages: [], issues: [], checkedAt: new Date().toISOString() };
+  const fail = msg => report.issues.push(msg);
+
+  const robotsRes = await get(origin + '/robots.txt');
+  let sitemapUrls = [];
+  if (robotsRes.status !== 200) {
+    fail(`robots.txt returned ${robotsRes.status || robotsRes.error}`);
+  } else {
+    const { sitemaps, blocksAll } = parseRobots(robotsRes.body);
+    if (blocksAll) fail('robots.txt disallows / for all crawlers — nothing will be indexed');
+    if (!sitemaps.length) fail('robots.txt declares no Sitemap:');
+    sitemapUrls = sitemaps;
+  }
+
+  const sitemapUrl = sitemapUrls[0] || origin + '/sitemap.xml';
+  const smRes = await get(sitemapUrl);
+  let urls = [];
+  if (smRes.status !== 200) {
+    fail(`sitemap ${sitemapUrl} returned ${smRes.status || smRes.error}`);
+  } else {
+    urls = parseSitemap(smRes.body);
+    if (!urls.length) fail(`sitemap ${sitemapUrl} lists no <loc> entries`);
+    const foreign = urls.filter(u => { try { return new URL(u).origin !== origin; } catch { return true; } });
+    if (foreign.length) fail(`sitemap lists ${foreign.length} URL(s) off-origin, e.g. ${foreign[0]}`);
+  }
+  report.sitemap = { url: sitemapUrl, count: urls.length };
+
+  const targets = urls.slice(0, limit);
+  const linkTargets = new Set();
+  report.pages = await mapLimit(targets, 6, async url => {
+    const res = await get(url);
+    if (res.status !== 200) {
+      fail(`${url} → ${res.status || res.error}`);
+      return { url, status: res.status, problems: ['not reachable'] };
+    }
+    const { title, problems } = checkHtml(res.body, url);
+    for (const l of internalLinks(res.body, url)) linkTargets.add(l);
+    for (const p of problems) fail(`${url} — ${p}`);
+    return { url, status: res.status, title, problems };
+  });
+
+  // Internal links that the sitemap never mentions are the usual source of dead ends.
+  const known = new Set(urls.map(normalise));
+  const unlisted = [...linkTargets].filter(l => !known.has(normalise(l)));
+  const broken = (await mapLimit(unlisted.slice(0, limit), 6, async l => {
+    const res = await get(l, 'HEAD');
+    return res.status >= 400 || res.status === 0 ? { url: l, status: res.status } : null;
+  })).filter(Boolean);
+  for (const b of broken) fail(`internal link ${b.url} → ${b.status || 'unreachable'}`);
+  report.brokenLinks = broken;
+
+  if (json) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    console.log(`\n  ${origin}`);
+    console.log(`  sitemap: ${report.sitemap.count} URLs (${sitemapUrl})`);
+    console.log(`  checked: ${report.pages.length} pages, ${unlisted.length} extra internal links\n`);
+    for (const p of report.pages) {
+      const mark = p.problems.length ? '✗' : '✓';
+      console.log(`  ${mark} ${p.url}${p.problems.length ? '\n      ' + p.problems.join('\n      ') : ''}`);
+    }
+    for (const b of broken) console.log(`  ✗ broken link ${b.url} → ${b.status || 'unreachable'}`);
+    console.log(report.issues.length
+      ? `\n  ${report.issues.length} issue(s) found.\n`
+      : `\n  All clear.\n`);
+  }
+  return report.issues.length ? 1 : 0;
+}
+
+async function submit(urls, key) {
+  if (!key) throw new Error('--key <indexnow-key> is required (host it at https://<host>/<key>.txt)');
+  const host = new URL(urls[0]).host;
+  const keyRes = await get(`https://${host}/${key}.txt`);
+  if (keyRes.status !== 200 || keyRes.body.trim() !== key) {
+    throw new Error(`key file https://${host}/${key}.txt must return 200 with the key as its body (got ${keyRes.status})`);
+  }
+  const res = await fetch('https://api.indexnow.org/indexnow', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'user-agent': UA },
+    body: JSON.stringify({ host, key, keyLocation: `https://${host}/${key}.txt`, urlList: urls }),
+  });
+  console.log(`  IndexNow HTTP ${res.status} for ${urls.length} URL(s) on ${host}`);
+  return res.ok ? 0 : 1;
+}
+
+// ---------- selftest ----------
+
+function selftest() {
+  const assert = (cond, msg) => { if (!cond) throw new Error('selftest: ' + msg); };
+
+  assert(parseSitemap('<url><loc>https://a.com/x</loc></url><url><loc> https://a.com/y </loc></url>')
+    .join(',') === 'https://a.com/x,https://a.com/y', 'parseSitemap');
+
+  const r = parseRobots('User-agent: *\nDisallow: /\nSitemap: https://a.com/sitemap.xml # note');
+  assert(r.blocksAll && r.sitemaps[0] === 'https://a.com/sitemap.xml', 'parseRobots blocking');
+  assert(!parseRobots('User-agent: *\nAllow: /\nDisallow: /admin/').blocksAll, 'parseRobots allowing');
+  assert(!parseRobots('User-agent: badbot\nDisallow: /').blocksAll, 'parseRobots per-agent block is not site-wide');
+
+  assert(findMojibake('cafÃ© naÃ¯ve').length > 0, 'mojibake detected');
+  assert(findMojibake('café naïve — clean copy').length === 0, 'clean text is not mojibake');
+
+  const good = `<title>T</title><meta name="description" content="d">
+    <link rel="canonical" href="https://a.com/p/"><meta name="robots" content="index,follow">`;
+  assert(checkHtml(good, 'https://a.com/p/').problems.length === 0, 'clean page passes');
+  assert(checkHtml(good, 'https://a.com/other/').problems.some(p => p.includes('canonical')), 'canonical mismatch caught');
+  assert(checkHtml('<title>T</title>', 'https://a.com/p/').problems.length === 2, 'missing canonical + description counted');
+  assert(checkHtml(good.replace('index,follow', 'noindex'), 'https://a.com/p/')
+    .problems.some(p => p.includes('noindex')), 'noindex caught');
+
+  const links = internalLinks('<a href="/a">1</a><a href="https://x.com/b">2</a><a href="/c.css">3</a><a href="#top">4</a>', 'https://a.com/p/');
+  assert(links.length === 1 && links[0] === 'https://a.com/a', 'internalLinks filters off-origin, assets, fragments');
+
+  console.log('selftest: all checks passed');
+  return 0;
+}
+
+// ---------- cli ----------
+
+const HELP = `sitepreflight — pre-flight checks for a static site, then tell the search engines.
+
+  sitepreflight check <url> [--limit N] [--json]
+  sitepreflight submit <url> [url...] --key <indexnow-key>
+  sitepreflight --selftest
+
+check   robots.txt, sitemap, then every page: status, <title>, meta description,
+        rel=canonical, noindex, mojibake, and internal links that 404.
+        Exits 1 if anything fails, so it gates a deploy in CI.
+submit  pings IndexNow (Bing, Yandex, Seznam, Naver) after verifying your key file.
+        Google does not participate in IndexNow.
+`;
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const args = process.argv.slice(2);
+  const flag = (name, fallback) => {
+    const i = args.indexOf(name);
+    return i === -1 ? fallback : args[i + 1];
+  };
+  const cmd = args[0];
+  try {
+    let code;
+    if (args.includes('--selftest')) code = selftest();
+    else if (cmd === 'check') code = await check(args[1], { limit: Number(flag('--limit', 50)), json: args.includes('--json') });
+    else if (cmd === 'submit') code = await submit(args.slice(1).filter(a => a.startsWith('http')), flag('--key'));
+    else { console.log(HELP); code = args.length ? 1 : 0; }
+    process.exit(code);
+  } catch (err) {
+    console.error('  error: ' + err.message);
+    process.exit(1);
+  }
+}
