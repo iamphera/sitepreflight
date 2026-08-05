@@ -239,7 +239,16 @@ submit  pings IndexNow (Bing, Yandex, Seznam, Naver) after verifying your key fi
         Google does not participate in IndexNow.
 `;
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// npx installs the bin as a symlink, so compare the resolved path — not argv[1] verbatim.
+const invokedDirectly = await (async () => {
+  if (!process.argv[1]) return false;
+  const { realpath } = await import('node:fs/promises');
+  const { pathToFileURL } = await import('node:url');
+  try { return import.meta.url === pathToFileURL(await realpath(process.argv[1])).href; }
+  catch { return false; }
+})();
+
+if (invokedDirectly) {
   const args = process.argv.slice(2);
   const flag = (name, fallback) => {
     const i = args.indexOf(name);
