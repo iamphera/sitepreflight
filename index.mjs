@@ -158,6 +158,9 @@ async function check(base, { limit, json }) {
     if (foreign.length) fail(`sitemap lists ${foreign.length} URL(s) off-origin, e.g. ${foreign[0]}`);
   }
   report.sitemap = { url: sitemapUrl, count: urls.length };
+  // Everything failed so far is site-level (robots/sitemap); later fails are per-page and
+  // get printed alongside their page. Snapshot so the text report can show these too.
+  const siteIssues = report.issues.slice();
 
   const targets = urls.slice(0, limit);
   const linkTargets = new Set();
@@ -183,22 +186,29 @@ async function check(base, { limit, json }) {
   for (const b of broken) fail(`internal link ${b.url} → ${b.status || 'unreachable'}`);
   report.brokenLinks = broken;
 
-  if (json) {
-    console.log(JSON.stringify(report, null, 2));
-  } else {
-    console.log(`\n  ${origin}`);
-    console.log(`  sitemap: ${report.sitemap.count} URLs (${sitemapUrl})`);
-    console.log(`  checked: ${report.pages.length} pages, ${unlisted.length} extra internal links\n`);
-    for (const p of report.pages) {
-      const mark = p.problems.length ? '✗' : '✓';
-      console.log(`  ${mark} ${p.url}${p.problems.length ? '\n      ' + p.problems.join('\n      ') : ''}`);
-    }
-    for (const b of broken) console.log(`  ✗ broken link ${b.url} → ${b.status || 'unreachable'}`);
-    console.log(report.issues.length
-      ? `\n  ${report.issues.length} issue(s) found.\n`
-      : `\n  All clear.\n`);
-  }
+  console.log(json ? JSON.stringify(report, null, 2)
+                   : renderText(report, siteIssues, unlisted.length));
   return report.issues.length ? 1 : 0;
+}
+
+// This text IS what a paying subscriber receives by email, so every issue counted in the
+// summary line must also be spelled out above it.
+function renderText(report, siteIssues, unlistedCount) {
+  const out = [
+    ``,
+    `  ${report.site}`,
+    `  sitemap: ${report.sitemap.count} URLs (${report.sitemap.url})`,
+    `  checked: ${report.pages.length} pages, ${unlistedCount} extra internal links`,
+    ``,
+  ];
+  for (const m of siteIssues) out.push(`  ✗ ${m}`);
+  for (const p of report.pages) {
+    const mark = p.problems.length ? '✗' : '✓';
+    out.push(`  ${mark} ${p.url}${p.problems.length ? '\n      ' + p.problems.join('\n      ') : ''}`);
+  }
+  for (const b of report.brokenLinks) out.push(`  ✗ broken link ${b.url} → ${b.status || 'unreachable'}`);
+  out.push(report.issues.length ? `\n  ${report.issues.length} issue(s) found.\n` : `\n  All clear.\n`);
+  return out.join('\n');
 }
 
 async function submit(urls, key) {
@@ -249,6 +259,17 @@ function selftest() {
 
   const links = internalLinks('<a href="/a">1</a><a href="https://x.com/b">2</a><a href="/c.css">3</a><a href="#top">4</a>', 'https://a.com/p/');
   assert(links.length === 1 && links[0] === 'https://a.com/a', 'internalLinks filters off-origin, assets, fragments');
+
+  // A site with no sitemap has only site-level issues and zero pages; the emailed report
+  // must name them, not just count them.
+  const siteOnly = {
+    site: 'https://a.com', sitemap: { url: 'https://a.com/sitemap.xml', count: 0 },
+    pages: [], brokenLinks: [],
+    issues: ['robots.txt returned 404', 'sitemap https://a.com/sitemap.xml returned 404'],
+  };
+  const text = renderText(siteOnly, siteOnly.issues, 0);
+  assert(siteOnly.issues.every(m => text.includes(m)), 'site-level issues are printed, not just counted');
+  assert(text.includes('2 issue(s) found'), 'issue count still summarised');
 
   console.log('selftest: all checks passed');
   return 0;
