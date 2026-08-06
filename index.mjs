@@ -126,10 +126,30 @@ export async function expandSitemapIndex(xml, fetchXml, note) {
 
 // ---------- network ----------
 
+// fetch()'s res.text() decodes as UTF-8 no matter what the page declares, so a site
+// served as ISO-8859-1 or Shift_JIS comes back as U+FFFD soup and every text check —
+// title, description, mojibake — then runs on garbage. Honour the declared charset.
+export function decodeBody(buf, contentType) {
+  const bytes = new Uint8Array(buf);
+  const header = /charset=["']?([\w-]+)/i.exec(contentType || '');
+  // No charset on the header: sniff <meta charset> from the first 1KB, which is ASCII
+  // in every encoding this matters for.
+  const meta = header ? null : /<meta[^>]+charset=["']?([\w-]+)/i.exec(
+    new TextDecoder('iso-8859-1').decode(bytes.subarray(0, 1024)));
+  const label = ((header || meta)?.[1] || 'utf-8').toLowerCase();
+  try {
+    return new TextDecoder(label).decode(bytes);
+  } catch {
+    return new TextDecoder('utf-8').decode(bytes); // unknown label — best effort
+  }
+}
+
 async function get(url, method = 'GET') {
   try {
     const res = await fetch(url, { method, headers: { 'user-agent': UA }, redirect: 'follow' });
-    const body = method === 'GET' ? await res.text() : '';
+    const body = method === 'GET'
+      ? decodeBody(await res.arrayBuffer(), res.headers.get('content-type'))
+      : '';
     return { status: res.status, body, url: res.url };
   } catch (err) {
     return { status: 0, body: '', url, error: err.message };
@@ -315,6 +335,18 @@ async function selftest() {
   assert(findMojibake('cafÃ© naÃ¯ve').length > 0, 'mojibake detected');
   assert(findMojibake('café naïve — clean copy').length === 0, 'clean text is not mojibake');
   assert(findMojibake('<code>cafÃ©</code> is what mojibake looks like').length === 0, 'code samples exempt from mojibake');
+
+  // Charset handling: a legacy-encoded page must survive the round trip, or every text
+  // check below runs on U+FFFD instead of the real copy.
+  const latin1 = Uint8Array.from([0x63, 0x61, 0x66, 0xe9]); // "café" as ISO-8859-1
+  assert(decodeBody(latin1, 'text/html; charset=iso-8859-1') === 'café', 'header charset honoured');
+  assert(decodeBody(latin1, 'text/html') !== 'café', 'undeclared latin-1 is not silently repaired');
+  const metaTagged = new TextEncoder().encode('<meta charset="utf-8"><p>café</p>');
+  assert(decodeBody(metaTagged, 'text/html').includes('café'), 'meta charset used when the header has none');
+  assert(decodeBody(new TextEncoder().encode('café'), 'text/html; charset=bogus-9') === 'café',
+    'unknown charset label falls back to utf-8');
+  assert(findMojibake(decodeBody(latin1, 'text/html; charset=iso-8859-1')).length === 0,
+    'correctly-served latin-1 is not reported as mojibake');
 
   const good = `<title>T</title><meta name="description" content="d">
     <link rel="canonical" href="https://a.com/p/"><meta name="robots" content="index,follow">`;

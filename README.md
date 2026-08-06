@@ -11,6 +11,10 @@ It catches the boring things that quietly cost you traffic after a deploy:
 - `noindex` left on a page you meant to publish
 - `rel=canonical` missing, or pointing at a different URL
 - mojibake (`cafÃ©`) from a bad encoding round-trip
+
+Pages served in a legacy charset (ISO-8859-1, Shift_JIS, windows-1251...) are decoded
+using the charset the page declares, so non-English copy is read as written rather than
+as replacement characters.
 - internal links that 404 and never appear in the sitemap
 
 Then, optionally, it pings IndexNow so Bing, Yandex, Seznam and Naver recrawl. (Google does not participate in IndexNow — nothing does that for you.)
