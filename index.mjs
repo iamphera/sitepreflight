@@ -8,11 +8,18 @@
 // Exit code is 1 when any check fails, so it works as a CI gate.
 
 const UA = 'sitepreflight/0.1 (+https://github.com/iamphera/sitepreflight)';
+const CHILD_SITEMAP_CAP = 50;
 
 // ---------- pure helpers (covered by --selftest) ----------
 
 export function parseSitemap(xml) {
   return [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map(m => m[1]);
+}
+
+// A <sitemapindex> lists other sitemaps, not pages. Astro, Next.js and Yoast all emit one
+// by default, so treating its <loc>s as pages means checking XML files for a <title>.
+export function isSitemapIndex(xml) {
+  return /<sitemapindex[\s>]/i.test(xml);
 }
 
 export function parseRobots(txt) {
@@ -133,6 +140,19 @@ async function check(base, { limit, json }) {
     fail(`sitemap ${sitemapUrl} returned ${smRes.status || smRes.error}`);
   } else {
     urls = parseSitemap(smRes.body);
+    if (isSitemapIndex(smRes.body)) {
+      // ponytail: one level of nesting only — an index of indexes is legal but vanishingly rare.
+      const children = urls.slice(0, CHILD_SITEMAP_CAP);
+      if (urls.length > children.length)
+        console.log(`  note: sitemap index lists ${urls.length} sitemaps, reading the first ${children.length}`);
+      const nested = await mapLimit(children, 6, async u => {
+        const r = await get(u);
+        if (r.status !== 200) { fail(`sitemap ${u} returned ${r.status || r.error}`); return []; }
+        return parseSitemap(r.body);
+      });
+      urls = [...new Set(nested.flat())];
+      report.sitemap_index = { url: sitemapUrl, sitemaps: children.length };
+    }
     if (!urls.length) fail(`sitemap ${sitemapUrl} lists no <loc> entries`);
     const foreign = urls.filter(u => { try { return new URL(u).origin !== origin; } catch { return true; } });
     if (foreign.length) fail(`sitemap lists ${foreign.length} URL(s) off-origin, e.g. ${foreign[0]}`);
@@ -204,6 +224,11 @@ function selftest() {
 
   assert(parseSitemap('<url><loc>https://a.com/x</loc></url><url><loc> https://a.com/y </loc></url>')
     .join(',') === 'https://a.com/x,https://a.com/y', 'parseSitemap');
+
+  assert(isSitemapIndex('<?xml version="1.0"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+    + '<sitemap><loc>https://a.com/sitemap-0.xml</loc></sitemap></sitemapindex>'), 'isSitemapIndex detects an index');
+  assert(!isSitemapIndex('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://a.com/x</loc></url></urlset>'),
+    'isSitemapIndex does not flag a plain urlset');
 
   const r = parseRobots('User-agent: *\nDisallow: /\nSitemap: https://a.com/sitemap.xml # note');
   assert(r.blocksAll && r.sitemaps[0] === 'https://a.com/sitemap.xml', 'parseRobots blocking');
