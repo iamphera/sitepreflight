@@ -49,6 +49,13 @@ export function findMojibake(html) {
   return [...new Set(hits)];
 }
 
+// Absent or unparseable Content-Type is treated as HTML — plenty of hand-rolled servers omit
+// it, and refusing to check those pages would be a worse failure than checking a stray file.
+export function isHtml(contentType) {
+  const t = (contentType || '').split(';')[0].trim().toLowerCase();
+  return !t || t === 'text/html' || t === 'application/xhtml+xml';
+}
+
 export function checkHtml(html, url) {
   const problems = [];
   const pick = re => (html.match(re) || [])[1];
@@ -79,10 +86,20 @@ function normalise(u) {
   } catch { return u; }
 }
 
+// The whitespace before `href` is load-bearing: Vue/Alpine/Angular write the DYNAMIC link as
+// `:href`, `v-bind:href`, `x-bind:href` or `[href]`, and a bare `href=` match happily lands
+// inside those. Allbirds (Shopify + Vue) served three "broken links" that were really the
+// unevaluated bindings `(cardRefs['…']?.selectedUrl) || '/x'` and `` `/products/${item.handle}` ``.
+// Fabricated 404s in a paid report are worse than a missed link, so require a real attribute
+// boundary and drop anything still carrying template syntax.
+const TEMPLATE_SYNTAX = /\$\{|\{\{|`|<%/;
+
 export function internalLinks(html, base) {
-  const hrefs = [...html.matchAll(/<a[^>]+href=["']([^"'#]+)["']/gi)].map(m => m[1]);
+  // `<a` needs the lookahead too, or <article ...href=...> and <audio> are harvested as links.
+  const hrefs = [...html.matchAll(/<a(?=[\s>])[^>]*\shref=["']([^"'#]+)["']/gi)].map(m => m[1]);
   const out = new Set();
   for (const h of hrefs) {
+    if (TEMPLATE_SYNTAX.test(h)) continue;
     let abs;
     try { abs = new URL(h, base); } catch { continue; }
     if (abs.origin !== new URL(base).origin) continue;
@@ -156,9 +173,9 @@ async function get(url, method = 'GET') {
     const body = method === 'GET'
       ? decodeBody(await res.arrayBuffer(), res.headers.get('content-type'))
       : '';
-    return { status: res.status, body, url: res.url };
+    return { status: res.status, body, url: res.url, type: res.headers.get('content-type') || '' };
   } catch (err) {
-    return { status: 0, body: '', url, error: err.message };
+    return { status: 0, body: '', url, type: '', error: err.message };
   }
 }
 
@@ -235,6 +252,14 @@ async function check(base, { limit, json }) {
     if (res.status !== 200) {
       fail(`${url} → ${res.status || res.error}`);
       return { url, status: res.status, problems: ['not reachable'] };
+    }
+    // allbirds.com's sitemap lists /agents.md (text/markdown). Running the HTML checks on it
+    // produced three findings that a customer can do nothing useful with; the actionable
+    // fact is that a non-page is in the sitemap at all.
+    if (!isHtml(res.type)) {
+      const p = `not an HTML page (${res.type.split(';')[0] || 'unknown type'}) — remove it from the sitemap`;
+      fail(`${url} — ${p}`);
+      return { url, status: res.status, problems: [p] };
     }
     const { title, problems } = checkHtml(res.body, url);
     for (const l of internalLinks(res.body, url)) linkTargets.add(l);
@@ -370,6 +395,24 @@ async function selftest() {
 
   const links = internalLinks('<a href="/a">1</a><a href="https://x.com/b">2</a><a href="/c.css">3</a><a href="#top">4</a>', 'https://a.com/p/');
   assert(links.length === 1 && links[0] === 'https://a.com/a', 'internalLinks filters off-origin, assets, fragments');
+
+  // Framework binding attributes are not links — matching inside them invents 404s.
+  const vue = internalLinks(
+    `<a :href="(cardRefs['1']?.selectedUrl) || '/products/x'">a</a>` +
+    "<a :href='`/products/${item.handle}`'>b</a>" +
+    '<a v-bind:href="u">c</a><a x-bind:href="u">d</a><a [href]="u">e</a>' +
+    '<a href="/real">f</a>', 'https://a.com/');
+  assert(vue.length === 1 && vue[0] === 'https://a.com/real', 'dynamic :href/v-bind/x-bind/[href] bindings are not treated as links');
+  // A server-side template that leaked into the served HTML is also not a URL.
+  assert(internalLinks('<a href="/p/{{ slug }}">x</a><a href="/p/<%= id %>">y</a>', 'https://a.com/').length === 0,
+    'unrendered template placeholders in a real href are skipped');
+  assert(internalLinks('<a\nhref="/a">x</a>', 'https://a.com/').length === 1, 'newline before href still matches');
+
+  assert(internalLinks('<article data-x="1" href="/nope">x</article><a href="/yes">y</a>', 'https://a.com/')
+    .join(',') === 'https://a.com/yes', 'only <a> is harvested, not <article>/<audio>');
+
+  assert(isHtml('text/html; charset=utf-8') && isHtml('') && isHtml(null), 'html and unknown types are checked');
+  assert(!isHtml('text/markdown; charset=utf-8') && !isHtml('application/pdf'), 'non-HTML sitemap entries are not run through the HTML checks');
 
   const seeded = seedFromHome('<a href="/">home</a><a href="/a">1</a><a href="https://x.com/b">2</a>', 'https://a.com');
   assert(seeded.join(',') === 'https://a.com/,https://a.com/a', 'seedFromHome leads with home, dedupes it, drops off-origin');
