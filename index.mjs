@@ -131,9 +131,15 @@ export async function expandSitemapIndex(xml, fetchXml, note) {
 // title, description, mojibake — then runs on garbage. Honour the declared charset.
 export function decodeBody(buf, contentType) {
   const bytes = new Uint8Array(buf);
+  // A BOM outranks both the header and <meta> (HTML spec), and it is the only thing
+  // that saves us on UTF-16, where the ASCII-ish meta sniff below is blind.
+  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return new TextDecoder('utf-8').decode(bytes);
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder('utf-16le').decode(bytes);
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder('utf-16be').decode(bytes);
+
   const header = /charset=["']?([\w-]+)/i.exec(contentType || '');
   // No charset on the header: sniff <meta charset> from the first 1KB, which is ASCII
-  // in every encoding this matters for.
+  // in every encoding that survives the BOM check above.
   const meta = header ? null : /<meta[^>]+charset=["']?([\w-]+)/i.exec(
     new TextDecoder('iso-8859-1').decode(bytes.subarray(0, 1024)));
   const label = ((header || meta)?.[1] || 'utf-8').toLowerCase();
@@ -347,6 +353,12 @@ async function selftest() {
     'unknown charset label falls back to utf-8');
   assert(findMojibake(decodeBody(latin1, 'text/html; charset=iso-8859-1')).length === 0,
     'correctly-served latin-1 is not reported as mojibake');
+  // A UTF-8 BOM on a page whose header lies about the charset (common on legacy CMS
+  // exports) must win, or the whole body decodes to mojibake.
+  const bom = Uint8Array.from([0xef, 0xbb, 0xbf, 0x63, 0x61, 0x66, 0xc3, 0xa9]);
+  assert(decodeBody(bom, 'text/html; charset=iso-8859-1').endsWith('café'), 'BOM outranks a lying header');
+  const utf16 = Uint8Array.from([0xff, 0xfe, 0x63, 0x00, 0x61, 0x00, 0x66, 0x00, 0xe9, 0x00]);
+  assert(decodeBody(utf16, 'text/html').endsWith('café'), 'UTF-16LE BOM decoded (meta sniff is blind to it)');
 
   const good = `<title>T</title><meta name="description" content="d">
     <link rel="canonical" href="https://a.com/p/"><meta name="robots" content="index,follow">`;
