@@ -9,6 +9,7 @@
 
 const UA = 'sitepreflight/0.1 (+https://github.com/iamphera/sitepreflight)';
 const CHILD_SITEMAP_CAP = 50;
+const INDEX_DEPTH_CAP = 3;
 
 // ---------- pure helpers (covered by --selftest) ----------
 
@@ -98,6 +99,31 @@ export function seedFromHome(html, origin) {
   return [...new Set([home, ...internalLinks(html, home)])];
 }
 
+// A <sitemapindex> is allowed to list further indexes, and Jetpack — which ships on a large
+// share of WordPress sites — always does: /sitemap.xml → /sitemap-index-1.xml → the urlsets.
+// Stopping after one level means checking XML files as if they were pages.
+// fetchXml returns the body, or null if it already reported the failure.
+export async function expandSitemapIndex(xml, fetchXml, note) {
+  const seen = new Set();
+  const pages = [];
+  let frontier = parseSitemap(xml);
+  let depth = 0;
+  for (; depth < INDEX_DEPTH_CAP && frontier.length; depth++) {
+    const batch = frontier.filter(u => !seen.has(u));
+    batch.forEach(u => seen.add(u));
+    if (batch.length > CHILD_SITEMAP_CAP)
+      note(`sitemap index lists ${batch.length} sitemaps, reading the first ${CHILD_SITEMAP_CAP}`);
+    const next = [];
+    for (const body of await mapLimit(batch.slice(0, CHILD_SITEMAP_CAP), 6, fetchXml)) {
+      if (body == null) continue;
+      (isSitemapIndex(body) ? next : pages).push(...parseSitemap(body));
+    }
+    frontier = next;
+  }
+  if (frontier.length) note(`sitemap index nests deeper than ${INDEX_DEPTH_CAP} levels — stopping there`);
+  return { urls: [...new Set(pages)], sitemaps: seen.size };
+}
+
 // ---------- network ----------
 
 async function get(url, method = 'GET') {
@@ -148,17 +174,13 @@ async function check(base, { limit, json }) {
   } else {
     urls = parseSitemap(smRes.body);
     if (isSitemapIndex(smRes.body)) {
-      // ponytail: one level of nesting only — an index of indexes is legal but vanishingly rare.
-      const children = urls.slice(0, CHILD_SITEMAP_CAP);
-      if (urls.length > children.length)
-        console.log(`  note: sitemap index lists ${urls.length} sitemaps, reading the first ${children.length}`);
-      const nested = await mapLimit(children, 6, async u => {
+      const expanded = await expandSitemapIndex(smRes.body, async u => {
         const r = await get(u);
-        if (r.status !== 200) { fail(`sitemap ${u} returned ${r.status || r.error}`); return []; }
-        return parseSitemap(r.body);
-      });
-      urls = [...new Set(nested.flat())];
-      report.sitemap_index = { url: sitemapUrl, sitemaps: children.length };
+        if (r.status !== 200) { fail(`sitemap ${u} returned ${r.status || r.error}`); return null; }
+        return r.body;
+      }, m => console.log('  note: ' + m));
+      urls = expanded.urls;
+      report.sitemap_index = { url: sitemapUrl, sitemaps: expanded.sitemaps };
     }
     if (!urls.length) fail(`sitemap ${sitemapUrl} lists no <loc> entries`);
     const foreign = urls.filter(u => { try { return new URL(u).origin !== origin; } catch { return true; } });
@@ -249,7 +271,7 @@ async function submit(urls, key) {
 
 // ---------- selftest ----------
 
-function selftest() {
+async function selftest() {
   const assert = (cond, msg) => { if (!cond) throw new Error('selftest: ' + msg); };
 
   assert(parseSitemap('<url><loc>https://a.com/x</loc></url><url><loc> https://a.com/y </loc></url>')
@@ -264,6 +286,31 @@ function selftest() {
   assert(r.blocksAll && r.sitemaps[0] === 'https://a.com/sitemap.xml', 'parseRobots blocking');
   assert(!parseRobots('User-agent: *\nAllow: /\nDisallow: /admin/').blocksAll, 'parseRobots allowing');
   assert(!parseRobots('User-agent: badbot\nDisallow: /').blocksAll, 'parseRobots per-agent block is not site-wide');
+
+  // Jetpack's real shape: index → index → urlset. One level of following returns XML files.
+  const index = locs => `<sitemapindex>${locs.map(l => `<loc>${l}</loc>`).join('')}</sitemapindex>`;
+  const urlset = locs => `<urlset>${locs.map(l => `<loc>${l}</loc>`).join('')}</urlset>`;
+  const tree = {
+    'https://a.com/sitemap-index-1.xml': index(['https://a.com/sitemap-1.xml', 'https://a.com/sitemap-2.xml']),
+    'https://a.com/sitemap-1.xml': urlset(['https://a.com/p1', 'https://a.com/p2']),
+    'https://a.com/sitemap-2.xml': urlset(['https://a.com/p2', 'https://a.com/p3']),
+  };
+  const fetchXml = async u => tree[u] ?? null;
+  const nestedRun = await expandSitemapIndex(index(['https://a.com/sitemap-index-1.xml']), fetchXml, () => {});
+  assert(nestedRun.urls.join(',') === 'https://a.com/p1,https://a.com/p2,https://a.com/p3',
+    'nested sitemap index resolves to deduped pages, not to the child .xml files');
+  assert(nestedRun.sitemaps === 3, 'every sitemap fetched is counted');
+  assert(!nestedRun.urls.some(u => u.endsWith('.xml')), 'no sitemap file is ever returned as a page');
+
+  const flat = await expandSitemapIndex(index(['https://a.com/sitemap-1.xml']), fetchXml, () => {});
+  assert(flat.urls.join(',') === 'https://a.com/p1,https://a.com/p2', 'single-level index still works');
+
+  // Deeper than the cap: stop and say so rather than recursing forever.
+  const notes = [];
+  const deep = u => `<sitemapindex><loc>${u}-x</loc></sitemapindex>`;
+  const endless = await expandSitemapIndex(deep('https://a.com/s'), async u => deep(u), m => notes.push(m));
+  assert(endless.urls.length === 0 && notes.some(n => n.includes('nests deeper')), 'depth cap stops and reports');
+  assert(endless.sitemaps === INDEX_DEPTH_CAP, 'depth cap stops after exactly the capped number of levels');
 
   assert(findMojibake('cafÃ© naÃ¯ve').length > 0, 'mojibake detected');
   assert(findMojibake('café naïve — clean copy').length === 0, 'clean text is not mojibake');
@@ -338,7 +385,7 @@ if (invokedDirectly) {
   const cmd = args[0];
   try {
     let code;
-    if (args.includes('--selftest')) code = selftest();
+    if (args.includes('--selftest')) code = await selftest();
     else if (cmd === 'check') code = await check(args[1], { limit: Number(flag('--limit', 50)), json: args.includes('--json') });
     else if (cmd === 'submit') code = await submit(args.slice(1).filter(a => a.startsWith('http')), flag('--key'));
     else { console.log(HELP); code = args.length ? 1 : 0; }

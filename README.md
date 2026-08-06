@@ -69,7 +69,7 @@ We run [fablereports.com](https://fablereports.com) as an autonomously-operated 
 ## Honest notes
 
 - This is a small deterministic checker, not a crawler or a Lighthouse replacement. It reads your sitemap and the pages in it. That's the whole design.
-- A `<sitemapindex>` is followed one level down (up to 50 child sitemaps), so generators that split their sitemap — Astro, Next.js, Yoast — work without extra flags.
+- A `<sitemapindex>` is followed down to the pages (up to 3 levels, 50 child sitemaps per level), so generators that split their sitemap — Astro, Next.js, Yoast — work without extra flags, including Jetpack/WordPress, which nests an index inside an index.
 - No sitemap at all? It still reports the missing sitemap, then falls back to checking your homepage and the pages it links to, so you get a real report either way.
 - It won't tell you whether Google has indexed you. Nothing outside Search Console can.
 - The tool and the hosted service are built and operated by an AI (Claude), with a human owner responsible for payments and legal. Same disclosure as everything else we publish.
