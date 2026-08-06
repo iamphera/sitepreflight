@@ -91,6 +91,13 @@ export function internalLinks(html, base) {
   return [...out];
 }
 
+// A site with no usable sitemap still needs its pages checked — the homepage plus
+// whatever it links to is a far better report than "you have no sitemap" and nothing.
+export function seedFromHome(html, origin) {
+  const home = origin + '/';
+  return [...new Set([home, ...internalLinks(html, home)])];
+}
+
 // ---------- network ----------
 
 async function get(url, method = 'GET') {
@@ -162,6 +169,17 @@ async function check(base, { limit, json }) {
   // get printed alongside their page. Snapshot so the text report can show these too.
   const siteIssues = report.issues.slice();
 
+  // Missing/empty sitemap meant zero pages checked, so the subscriber got a report about
+  // their sitemap and nothing about their site. Crawl from the homepage instead.
+  if (!urls.length) {
+    const home = await get(origin + '/');
+    if (home.status !== 200) fail(`${origin}/ → ${home.status || home.error}`);
+    else {
+      urls = seedFromHome(home.body, origin);
+      report.crawledFromHome = true;
+    }
+  }
+
   const targets = urls.slice(0, limit);
   const linkTargets = new Set();
   report.pages = await mapLimit(targets, 6, async url => {
@@ -197,7 +215,9 @@ function renderText(report, siteIssues, unlistedCount) {
   const out = [
     ``,
     `  ${report.site}`,
-    `  sitemap: ${report.sitemap.count} URLs (${report.sitemap.url})`,
+    report.crawledFromHome
+      ? `  no usable sitemap — crawled from the homepage instead`
+      : `  sitemap: ${report.sitemap.count} URLs (${report.sitemap.url})`,
     `  checked: ${report.pages.length} pages, ${unlistedCount} extra internal links`,
     ``,
   ];
@@ -259,6 +279,16 @@ function selftest() {
 
   const links = internalLinks('<a href="/a">1</a><a href="https://x.com/b">2</a><a href="/c.css">3</a><a href="#top">4</a>', 'https://a.com/p/');
   assert(links.length === 1 && links[0] === 'https://a.com/a', 'internalLinks filters off-origin, assets, fragments');
+
+  const seeded = seedFromHome('<a href="/">home</a><a href="/a">1</a><a href="https://x.com/b">2</a>', 'https://a.com');
+  assert(seeded.join(',') === 'https://a.com/,https://a.com/a', 'seedFromHome leads with home, dedupes it, drops off-origin');
+
+  const crawlText = renderText({
+    site: 'https://a.com', sitemap: { url: 'https://a.com/sitemap.xml', count: 0 }, crawledFromHome: true,
+    pages: [{ url: 'https://a.com/', problems: [] }], brokenLinks: [], issues: ['sitemap https://a.com/sitemap.xml returned 404'],
+  }, ['sitemap https://a.com/sitemap.xml returned 404'], 0);
+  assert(crawlText.includes('crawled from the homepage'), 'fallback crawl is disclosed in the report');
+  assert(crawlText.includes('https://a.com/'), 'fallback crawl still lists the pages it checked');
 
   // A site with no sitemap has only site-level issues and zero pages; the emailed report
   // must name them, not just count them.
