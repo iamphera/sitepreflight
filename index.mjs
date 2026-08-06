@@ -56,21 +56,49 @@ export function isHtml(contentType) {
   return !t || t === 'text/html' || t === 'application/xhtml+xml';
 }
 
+// HTML5 allows unquoted attribute values and real sites ship them: ghost.org serves
+// `<link rel="canonical" href=https://ghost.org/about/>`, so a quotes-only regex reported
+// "no rel=canonical" on six pages that all had one. Telling a paying customer to add a tag
+// they already have is the same class of failure as inventing a 404.
+// `name` is always a literal here; it is interpolated into the pattern unescaped.
+// Quoted forms are tried first: a quoted value may contain the text `href=`, and preferring
+// the quoted match means `<a title="see href=/evil" href="/real">` resolves to /real.
+export function attrValue(tag, name) {
+  const q = tag.match(new RegExp(`\\s${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, 'i'));
+  if (q) return q[1] !== undefined ? q[1] : q[2];
+  const u = tag.match(new RegExp(`\\s${name}\\s*=\\s*([^\\s"'\`=<>]+)`, 'i'));
+  return u ? u[1] : undefined;
+}
+
+// A `>` inside a quoted value does NOT close the tag: `content="Compare A > B"` truncated a
+// plain `[^>]*>` matcher mid-attribute, which reported a missing description on a page that
+// had one. Skip over quoted spans instead.
+const openTag = name => new RegExp(`<${name}(?=[\\s>])(?:"[^"]*"|'[^']*'|[^>])*>`, 'gi');
+
+// Returns the opening tags of `name` whose `attr` contains `value` as a token — `rel` is a
+// space-separated list, so `rel="canonical alternate"` is still a canonical.
+function tagsWhere(html, name, attr, value) {
+  return [...html.matchAll(openTag(name))]
+    .map(m => m[0])
+    .filter(t => (attrValue(t, attr) || '').trim().toLowerCase().split(/\s+/).includes(value));
+}
+
 export function checkHtml(html, url) {
   const problems = [];
   const pick = re => (html.match(re) || [])[1];
+  const meta = n => attrValue(tagsWhere(html, 'meta', 'name', n)[0] || '', 'content');
 
   const title = pick(/<title[^>]*>([^<]*)<\/title>/i);
   if (!title || !title.trim()) problems.push('no <title>');
 
-  const robots = pick(/<meta[^>]+name=["']robots["'][^>]*content=["']([^"']+)["']/i) || '';
+  const robots = meta('robots') || '';
   if (/noindex/i.test(robots)) problems.push(`meta robots says noindex ("${robots}")`);
 
-  const canonical = pick(/<link[^>]+rel=["']canonical["'][^>]*href=["']([^"']+)["']/i);
+  const canonical = attrValue(tagsWhere(html, 'link', 'rel', 'canonical')[0] || '', 'href');
   if (!canonical) problems.push('no rel=canonical');
   else if (normalise(canonical) !== normalise(url)) problems.push(`canonical points elsewhere (${canonical})`);
 
-  const desc = pick(/<meta[^>]+name=["']description["'][^>]*content=["']([^"']*)["']/i);
+  const desc = meta('description');
   if (!desc || !desc.trim()) problems.push('no meta description');
 
   const mojibake = findMojibake(html);
@@ -96,14 +124,21 @@ const TEMPLATE_SYNTAX = /\$\{|\{\{|`|<%/;
 
 export function internalLinks(html, base) {
   // `<a` needs the lookahead too, or <article ...href=...> and <audio> are harvested as links.
-  const hrefs = [...html.matchAll(/<a(?=[\s>])[^>]*\shref=["']([^"'#]+)["']/gi)].map(m => m[1]);
+  // attrValue's leading `\s` keeps the binding guard: `:href`/`[href]`/`v-bind:href` never match.
+  const hrefs = [...html.matchAll(openTag('a'))].map(m => attrValue(m[0], 'href'));
   const out = new Set();
-  for (const h of hrefs) {
+  for (const raw of hrefs) {
+    const h = (raw || '').split('#')[0];
+    if (!h) continue;
     if (TEMPLATE_SYNTAX.test(h)) continue;
     let abs;
     try { abs = new URL(h, base); } catch { continue; }
     if (abs.origin !== new URL(base).origin) continue;
     if (/\.(png|jpe?g|gif|svg|webp|ico|css|js|pdf|xml|txt)$/i.test(abs.pathname)) continue;
+    // Cloudflare's email obfuscation emits <a href="/cdn-cgi/l/email-protection#hex">, which
+    // only resolves in the browser and 404s to a plain GET. It is Cloudflare's endpoint, not
+    // a page of the site, and the owner cannot fix it.
+    if (abs.pathname.startsWith('/cdn-cgi/')) continue;
     out.add(abs.origin + abs.pathname);
   }
   return [...out];
@@ -393,8 +428,39 @@ async function selftest() {
   assert(checkHtml(good.replace('index,follow', 'noindex'), 'https://a.com/p/')
     .problems.some(p => p.includes('noindex')), 'noindex caught');
 
+  // Unquoted attribute values are legal HTML5 and ghost.org ships them.
+  const bare = `<title>T</title><meta name=description content=d>
+    <link rel=canonical href=https://a.com/p/><meta name=robots content=noindex>`;
+  assert(checkHtml(bare, 'https://a.com/p/').problems.length === 1, 'unquoted attributes are read, not reported missing');
+  assert(checkHtml(bare, 'https://a.com/p/').problems.some(p => p.includes('noindex')), 'unquoted noindex caught');
+  assert(attrValue('<link rel="canonical" href=https://a.com/x>', 'href') === 'https://a.com/x', 'unquoted href');
+  assert(attrValue("<a href='/q'>", 'href') === '/q', 'single-quoted href');
+  assert(attrValue('<a data-href="/no">', 'href') === undefined, 'a prefixed attribute is not href');
+  // A `>` inside a quoted value must not end the tag, or a page with one loses the attribute.
+  assert(checkHtml(`<title>T</title><meta name="description" content="Compare A > B today">
+    <link rel="canonical" href="https://a.com/p/">`, 'https://a.com/p/').problems.length === 0,
+    'a > inside a quoted attribute value does not truncate the tag');
+  assert(internalLinks('<a title="A > B" href="/a">1</a>', 'https://a.com/')[0] === 'https://a.com/a',
+    'a > inside a quoted value does not hide the href');
+  // rel is a space-separated token list.
+  assert(checkHtml(`<title>T</title><meta name="description" content="d">
+    <link rel="alternate canonical" href="https://a.com/p/">`, 'https://a.com/p/').problems.length === 0,
+    'rel with several tokens still counts as canonical');
+  assert(attrValue('<a title="see href=/evil" href="/real">', 'href') === '/real',
+    'a quoted href wins over the text of another attribute');
+  // The canonical must come from a rel=canonical link, not the first <link> on the page.
+  assert(checkHtml(`<title>T</title><meta name="description" content="d">
+    <link rel="stylesheet" href="/s.css"><link rel="canonical" href="https://a.com/p/">`,
+    'https://a.com/p/').problems.length === 0, 'canonical found past an earlier <link>');
+
   const links = internalLinks('<a href="/a">1</a><a href="https://x.com/b">2</a><a href="/c.css">3</a><a href="#top">4</a>', 'https://a.com/p/');
   assert(links.length === 1 && links[0] === 'https://a.com/a', 'internalLinks filters off-origin, assets, fragments');
+  // A fragment used to void the whole href, so /pricing#plans was never checked at all.
+  assert(internalLinks('<a href="/pricing#plans">p</a>', 'https://a.com/')[0] === 'https://a.com/pricing',
+    'a fragment is stripped, not treated as an unlinkable href');
+  assert(internalLinks('<a href="/cdn-cgi/l/email-protection#a1b2">e</a>', 'https://a.com/').length === 0,
+    "Cloudflare's email-protection stub is not a page of the site");
+  assert(internalLinks('<a href=/bare>b</a>', 'https://a.com/')[0] === 'https://a.com/bare', 'unquoted href harvested');
 
   // Framework binding attributes are not links — matching inside them invents 404s.
   const vue = internalLinks(
@@ -464,6 +530,20 @@ const invokedDirectly = await (async () => {
 })();
 
 if (invokedDirectly) {
+  // Node caps response headers at 16KB and a bigger set is a HARD fetch failure
+  // ("Headers Overflow Error"), which we reported as "unreachable". webflow.com sends ~20KB
+  // of Set-Cookie, so every one of its URLs looked broken — five invented broken links on
+  // the first real Webflow site we tried. The cap is process-wide and settable only by flag.
+  const http = await import('node:http');
+  if (process.argv[2] === 'check' && http.default.maxHeaderSize < 65536 && !process.env.SITEPREFLIGHT_HEADER_CAP) {
+    const { spawnSync } = await import('node:child_process');
+    const { fileURLToPath } = await import('node:url');
+    const r = spawnSync(process.execPath,
+      ['--max-http-header-size=65536', fileURLToPath(import.meta.url), ...process.argv.slice(2)],
+      { stdio: 'inherit', env: { ...process.env, SITEPREFLIGHT_HEADER_CAP: '1' } });
+    process.exit(r.status ?? 1);
+  }
+
   const args = process.argv.slice(2);
   const flag = (name, fallback) => {
     const i = args.indexOf(name);
