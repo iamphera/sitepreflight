@@ -215,6 +215,21 @@ export function decodeBody(buf, contentType) {
   }
 }
 
+// Node collapses every DNS/TLS/socket failure into the same "fetch failed" and hides the
+// actual reason on err.cause. potion.so's certificate had EXPIRED and all we told the owner
+// was "robots.txt returned fetch failed" three times — an expired cert is exactly the kind
+// of deploy-blocking fault this tool exists to catch, so report the deepest cause instead.
+function fetchErrorReason(err) {
+  let c = err, best = err;
+  for (let depth = 0; c.cause && depth < 5; depth++) { // depth cap: cause chains can cycle
+    c = c.cause;
+    // Node wraps dual-stack connect failures in an AggregateError whose own message is
+    // empty; taking it blindly would print "robots.txt returned " and say even less.
+    if (c.message) best = c;
+  }
+  return (best.code ? `${best.message} (${best.code})` : best.message) || 'fetch failed';
+}
+
 async function get(url, method = 'GET') {
   try {
     const res = await fetch(url, { method, headers: { 'user-agent': UA }, redirect: 'follow' });
@@ -223,7 +238,7 @@ async function get(url, method = 'GET') {
       : '';
     return { status: res.status, body, url: res.url, type: res.headers.get('content-type') || '' };
   } catch (err) {
-    return { status: 0, body: '', url, type: '', error: err.message };
+    return { status: 0, body: '', url, type: '', error: fetchErrorReason(err) };
   }
 }
 
@@ -391,6 +406,27 @@ async function selftest() {
     + '<sitemap><loc>https://a.com/sitemap-0.xml</loc></sitemap></sitemapindex>'), 'isSitemapIndex detects an index');
   assert(!isSitemapIndex('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://a.com/x</loc></url></urlset>'),
     'isSitemapIndex does not flag a plain urlset');
+
+  // The real shape Node throws for an expired certificate: TypeError('fetch failed') whose
+  // cause carries the only useful words in the whole object.
+  const certErr = Object.assign(new TypeError('fetch failed'),
+    { cause: Object.assign(new Error('certificate has expired'), { code: 'CERT_HAS_EXPIRED' }) });
+  assert(fetchErrorReason(certErr) === 'certificate has expired (CERT_HAS_EXPIRED)',
+    'fetchErrorReason surfaces the cause, not "fetch failed"');
+  assert(fetchErrorReason(new Error('boom')) === 'boom', 'fetchErrorReason passes a plain error through');
+  const cyclic = new Error('a');
+  cyclic.cause = cyclic;
+  assert(fetchErrorReason(cyclic) === 'a', 'fetchErrorReason survives a cyclic cause chain');
+  const viaAggregate = Object.assign(new TypeError('fetch failed'),
+    { cause: Object.assign(new AggregateError([], ''), { cause: new Error('') }) });
+  assert(fetchErrorReason(viaAggregate) === 'fetch failed',
+    'fetchErrorReason never returns an empty reason');
+  assert(fetchErrorReason(Object.assign(new TypeError('fetch failed'), {
+    cause: Object.assign(new AggregateError([], ''), {
+      cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:443'), { code: 'ECONNREFUSED' }),
+    }),
+  })) === 'connect ECONNREFUSED 127.0.0.1:443 (ECONNREFUSED)',
+    'fetchErrorReason skips a message-less AggregateError to reach the real cause');
 
   const r = parseRobots('User-agent: *\nDisallow: /\nSitemap: https://a.com/sitemap.xml # note');
   assert(r.blocksAll && r.sitemaps[0] === 'https://a.com/sitemap.xml', 'parseRobots blocking');
