@@ -10,6 +10,7 @@
 import { gunzipSync, gzipSync } from 'node:zlib';
 
 const UA = 'sitepreflight/0.1 (+https://github.com/iamphera/sitepreflight)';
+const ACCEPT = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8';
 const CHILD_SITEMAP_CAP = 50;
 const INDEX_DEPTH_CAP = 3;
 
@@ -107,6 +108,10 @@ export function checkHtml(html, url) {
   if (mojibake.length) problems.push(`mojibake: ${mojibake.slice(0, 4).join(' ')}`);
 
   return { title, problems };
+}
+
+export function hasPath(u) {
+  try { return new URL(u).pathname.replace(/\/+$/, '') !== ''; } catch { return false; }
 }
 
 function normalise(u) {
@@ -232,7 +237,12 @@ function fetchErrorReason(err) {
 
 async function get(url, method = 'GET') {
   try {
-    const res = await fetch(url, { method, headers: { 'user-agent': UA }, redirect: 'follow' });
+    // Node's default `Accept: */*` is not what a visitor sends, and some hosts refuse it:
+    // Shopify's customer-account OAuth page answers 406 to */*, so hydrogen.shop/account was
+    // reported as a broken link when a browser gets a page. Ask for what a browser asks for.
+    // */*;q=0.8 keeps sitemaps/robots.txt acceptable, so nothing else changes.
+    const headers = { 'user-agent': UA, accept: ACCEPT };
+    const res = await fetch(url, { method, headers, redirect: 'follow' });
     const body = method === 'GET'
       ? decodeBody(await res.arrayBuffer(), res.headers.get('content-type'))
       : '';
@@ -316,7 +326,11 @@ async function check(base, { limit, json }) {
     }
   }
 
-  const targets = urls.slice(0, limit);
+  // Only the origin survived line 1 of this function, so `check https://site/docs/x --limit 6`
+  // reported on six unrelated sitemap pages and never fetched /docs/x — the one page the
+  // caller actually named. Check the requested page first; a bare origin keeps the old order.
+  const targets = (hasPath(base) ? [base, ...urls.filter(u => normalise(u) !== normalise(base))] : urls)
+    .slice(0, limit);
   const linkTargets = new Set();
   report.pages = await mapLimit(targets, 6, async url => {
     const res = await get(url);
@@ -542,6 +556,19 @@ async function selftest() {
 
   const seeded = seedFromHome('<a href="/">home</a><a href="/a">1</a><a href="https://x.com/b">2</a>', 'https://a.com');
   assert(seeded.join(',') === 'https://a.com/,https://a.com/a', 'seedFromHome leads with home, dedupes it, drops off-origin');
+
+  // The requested page must survive the --limit slice, or we report on a site the caller
+  // did not ask about. A bare origin must NOT be hoisted (it would change every existing run).
+  assert(hasPath('https://a.com/docs/x') && hasPath('https://a.com/docs'), 'a real path is detected');
+  assert(!hasPath('https://a.com') && !hasPath('https://a.com/') && !hasPath('https://a.com//'), 'a bare origin has no path');
+  const hoist = (base, urls, limit) =>
+    (hasPath(base) ? [base, ...urls.filter(u => normalise(u) !== normalise(base))] : urls).slice(0, limit);
+  assert(hoist('https://a.com/docs/x', ['https://a.com/1', 'https://a.com/2'], 1)[0] === 'https://a.com/docs/x',
+    'the requested page is checked even at --limit 1');
+  assert(hoist('https://a.com/docs/x/', ['https://a.com/docs/x', 'https://a.com/1'], 9).length === 2,
+    'the requested page is not checked twice when the sitemap lists it (trailing slash included)');
+  assert(hoist('https://a.com', ['https://a.com/1'], 9).join(',') === 'https://a.com/1',
+    'a bare origin leaves the sitemap order untouched');
 
   const crawlText = renderText({
     site: 'https://a.com', sitemap: { url: 'https://a.com/sitemap.xml', count: 0 }, crawledFromHome: true,
