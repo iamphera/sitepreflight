@@ -91,18 +91,30 @@ export function checkHtml(html, url) {
   const pick = re => (html.match(re) || [])[1];
   const meta = n => attrValue(tagsWhere(html, 'meta', 'name', n)[0] || '', 'content');
 
+  // Present-but-empty is a different bug from absent, and saying "no <title>" to an owner
+  // whose page HAS `<meta name="description" content="">` sends them looking for a tag they
+  // will find, then disbelieving the report. mozilla.org/en-US/products/monitor/ ships
+  // exactly that empty description.
   const title = pick(/<title[^>]*>([^<]*)<\/title>/i);
-  if (!title || !title.trim()) problems.push('no <title>');
+  if (title === undefined) problems.push('no <title>');
+  else if (!title.trim()) problems.push('<title> is empty');
 
   const robots = meta('robots') || '';
   if (/noindex/i.test(robots)) problems.push(`meta robots says noindex ("${robots}")`);
 
-  const canonical = attrValue(tagsWhere(html, 'link', 'rel', 'canonical')[0] || '', 'href');
-  if (!canonical) problems.push('no rel=canonical');
+  // The tag is looked up separately from its attribute: `<link rel="canonical">` with no
+  // href is a present tag with nothing in it, and calling that "no rel=canonical" sends the
+  // owner hunting for a tag they will find.
+  const canonTag = tagsWhere(html, 'link', 'rel', 'canonical')[0];
+  const canonical = attrValue(canonTag || '', 'href');
+  if (!canonTag) problems.push('no rel=canonical');
+  else if (!canonical || !canonical.trim()) problems.push('rel=canonical has an empty href');
   else if (normalise(canonical) !== normalise(url)) problems.push(`canonical points elsewhere (${canonical})`);
 
-  const desc = meta('description');
-  if (!desc || !desc.trim()) problems.push('no meta description');
+  const descTag = tagsWhere(html, 'meta', 'name', 'description')[0];
+  const desc = attrValue(descTag || '', 'content');
+  if (!descTag) problems.push('no meta description');
+  else if (!desc || !desc.trim()) problems.push('meta description is empty');
 
   const mojibake = findMojibake(html);
   if (mojibake.length) problems.push(`mojibake: ${mojibake.slice(0, 4).join(' ')}`);
@@ -501,6 +513,20 @@ async function selftest() {
   assert(checkHtml('<title>T</title>', 'https://a.com/p/').problems.length === 2, 'missing canonical + description counted');
   assert(checkHtml(good.replace('index,follow', 'noindex'), 'https://a.com/p/')
     .problems.some(p => p.includes('noindex')), 'noindex caught');
+
+  // An empty tag is not a missing tag — mozilla.org ships `content=""`.
+  const emptyDesc = checkHtml(good.replace('content="d"', 'content=""'), 'https://a.com/p/').problems;
+  assert(emptyDesc.length === 1 && emptyDesc[0] === 'meta description is empty', 'empty description not called missing');
+  const emptyTitle = checkHtml(good.replace('<title>T</title>', '<title> </title>'), 'https://a.com/p/').problems;
+  assert(emptyTitle.length === 1 && emptyTitle[0] === '<title> is empty', 'blank title not called missing');
+  const emptyCanon = checkHtml(good.replace('href="https://a.com/p/"', 'href=""'), 'https://a.com/p/').problems;
+  assert(emptyCanon.length === 1 && emptyCanon[0].includes('empty href'), 'empty canonical href not called missing');
+  assert(checkHtml('<title>T</title>', 'https://a.com/p/').problems
+    .every(p => p.startsWith('no ')), 'genuinely absent tags still report as missing');
+  assert(checkHtml(good.replace(' content="d"', ''), 'https://a.com/p/').problems[0] === 'meta description is empty',
+    'a description tag with no content attribute is empty, not missing');
+  assert(checkHtml(good.replace(' href="https://a.com/p/"', ''), 'https://a.com/p/').problems[0].includes('empty href'),
+    'a canonical tag with no href attribute is empty, not missing');
 
   // Unquoted attribute values are legal HTML5 and ghost.org ships them.
   const bare = `<title>T</title><meta name=description content=d>
