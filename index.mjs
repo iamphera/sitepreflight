@@ -7,6 +7,8 @@
 //
 // Exit code is 1 when any check fails, so it works as a CI gate.
 
+import { gunzipSync, gzipSync } from 'node:zlib';
+
 const UA = 'sitepreflight/0.1 (+https://github.com/iamphera/sitepreflight)';
 const CHILD_SITEMAP_CAP = 50;
 const INDEX_DEPTH_CAP = 3;
@@ -182,7 +184,18 @@ export async function expandSitemapIndex(xml, fetchXml, note) {
 // served as ISO-8859-1 or Shift_JIS comes back as U+FFFD soup and every text check —
 // title, description, mojibake — then runs on garbage. Honour the declared charset.
 export function decodeBody(buf, contentType) {
-  const bytes = new Uint8Array(buf);
+  let bytes = new Uint8Array(buf);
+  // Google accepts a gzipped sitemap and real sites ship one (g2.com declares
+  // sitemap_index.xml.gz in robots.txt). It arrives as application/gzip with no
+  // Content-Encoding, so fetch does not unwrap it and the XML parse silently finds
+  // zero <loc>s — i.e. we would tell the owner their sitemap is empty when it is fine.
+  if (bytes[0] === 0x1f && bytes[1] === 0x8b) {
+    // Cap the output: gzip amplifies ~1000x, so an unbounded gunzip of a small download can
+    // OOM-kill the process and the CI gate dies with no report at all. The sitemap protocol
+    // caps an uncompressed sitemap at 50MB, so nothing legitimate is refused here.
+    try { bytes = new Uint8Array(gunzipSync(bytes, { maxOutputLength: 64 * 1024 * 1024 })); }
+    catch { /* truncated, corrupt, or absurdly large — decode as-is and report unreadable */ }
+  }
   // A BOM outranks both the header and <meta> (HTML spec), and it is the only thing
   // that saves us on UTF-16, where the ASCII-ish meta sniff below is blind.
   if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return new TextDecoder('utf-8').decode(bytes);
@@ -232,6 +245,11 @@ async function check(base, { limit, json }) {
   const origin = new URL(base).origin;
   const report = { site: origin, pages: [], issues: [], checkedAt: new Date().toISOString() };
   const fail = msg => report.issues.push(msg);
+  // Issues printed next to their own page/link below. Everything else has to be printed by
+  // renderText, or it gets counted in the summary and never shown — the failure that made
+  // tailwindcss.com report "2 issue(s) found." and list nothing in 0.1.1.
+  const inline = new Set();
+  const failInline = msg => { inline.add(msg); fail(msg); };
 
   const robotsRes = await get(origin + '/robots.txt');
   let sitemapUrls = [];
@@ -260,20 +278,23 @@ async function check(base, { limit, json }) {
       urls = expanded.urls;
       report.sitemap_index = { url: sitemapUrl, sitemaps: expanded.sitemaps };
     }
-    if (!urls.length) fail(`sitemap ${sitemapUrl} lists no <loc> entries`);
+    // "lists no <loc> entries" is the wrong advice when the body is not a sitemap at all —
+    // an SPA shell served with 200 for /sitemap.xml, or a .gz we could not decompress.
+    if (!urls.length) fail(/<(urlset|sitemapindex)[\s>]/i.test(smRes.body)
+      ? `sitemap ${sitemapUrl} lists no <loc> entries`
+      : `sitemap ${sitemapUrl} returned 200 but the body is not a readable sitemap`);
     const foreign = urls.filter(u => { try { return new URL(u).origin !== origin; } catch { return true; } });
     if (foreign.length) fail(`sitemap lists ${foreign.length} URL(s) off-origin, e.g. ${foreign[0]}`);
   }
   report.sitemap = { url: sitemapUrl, count: urls.length };
-  // Everything failed so far is site-level (robots/sitemap); later fails are per-page and
-  // get printed alongside their page. Snapshot so the text report can show these too.
-  const siteIssues = report.issues.slice();
 
   // Missing/empty sitemap meant zero pages checked, so the subscriber got a report about
   // their sitemap and nothing about their site. Crawl from the homepage instead.
   if (!urls.length) {
     const home = await get(origin + '/');
-    if (home.status !== 200) fail(`${origin}/ → ${home.status || home.error}`);
+    // g2.com answers 403 to both its sitemap and its homepage (bot protection), which left
+    // nothing at all to check — say that outright instead of shipping a bare issue count.
+    if (home.status !== 200) fail(`${origin}/ → ${home.status || home.error} — no sitemap and no readable homepage, so no pages could be checked`);
     else {
       urls = seedFromHome(home.body, origin);
       report.crawledFromHome = true;
@@ -285,20 +306,22 @@ async function check(base, { limit, json }) {
   report.pages = await mapLimit(targets, 6, async url => {
     const res = await get(url);
     if (res.status !== 200) {
-      fail(`${url} → ${res.status || res.error}`);
-      return { url, status: res.status, problems: ['not reachable'] };
+      failInline(`${url} → ${res.status || res.error}`);
+      // "not reachable" told the customer nothing: a 404 to fix, a 403 from their own bot
+      // protection, and a timeout are three different jobs. Name the status.
+      return { url, status: res.status, problems: [`returned ${res.status || res.error}`] };
     }
     // allbirds.com's sitemap lists /agents.md (text/markdown). Running the HTML checks on it
     // produced three findings that a customer can do nothing useful with; the actionable
     // fact is that a non-page is in the sitemap at all.
     if (!isHtml(res.type)) {
       const p = `not an HTML page (${res.type.split(';')[0] || 'unknown type'}) — remove it from the sitemap`;
-      fail(`${url} — ${p}`);
+      failInline(`${url} — ${p}`);
       return { url, status: res.status, problems: [p] };
     }
     const { title, problems } = checkHtml(res.body, url);
     for (const l of internalLinks(res.body, url)) linkTargets.add(l);
-    for (const p of problems) fail(`${url} — ${p}`);
+    for (const p of problems) failInline(`${url} — ${p}`);
     return { url, status: res.status, title, problems };
   });
 
@@ -309,17 +332,18 @@ async function check(base, { limit, json }) {
     const res = await get(l, 'HEAD');
     return res.status >= 400 || res.status === 0 ? { url: l, status: res.status } : null;
   })).filter(Boolean);
-  for (const b of broken) fail(`internal link ${b.url} → ${b.status || 'unreachable'}`);
+  for (const b of broken) failInline(`internal link ${b.url} → ${b.status || 'unreachable'}`);
   report.brokenLinks = broken;
 
   console.log(json ? JSON.stringify(report, null, 2)
-                   : renderText(report, siteIssues, unlisted.length));
+                   : renderText(report, inline, unlisted.length));
   return report.issues.length ? 1 : 0;
 }
 
 // This text IS what a paying subscriber receives by email, so every issue counted in the
 // summary line must also be spelled out above it.
-function renderText(report, siteIssues, unlistedCount) {
+function renderText(report, inline, unlistedCount) {
+  const siteIssues = report.issues.filter(m => !inline.has(m));
   const out = [
     ``,
     `  ${report.site}`,
@@ -486,7 +510,7 @@ async function selftest() {
   const crawlText = renderText({
     site: 'https://a.com', sitemap: { url: 'https://a.com/sitemap.xml', count: 0 }, crawledFromHome: true,
     pages: [{ url: 'https://a.com/', problems: [] }], brokenLinks: [], issues: ['sitemap https://a.com/sitemap.xml returned 404'],
-  }, ['sitemap https://a.com/sitemap.xml returned 404'], 0);
+  }, new Set(), 0);
   assert(crawlText.includes('crawled from the homepage'), 'fallback crawl is disclosed in the report');
   assert(crawlText.includes('https://a.com/'), 'fallback crawl still lists the pages it checked');
 
@@ -497,9 +521,31 @@ async function selftest() {
     pages: [], brokenLinks: [],
     issues: ['robots.txt returned 404', 'sitemap https://a.com/sitemap.xml returned 404'],
   };
-  const text = renderText(siteOnly, siteOnly.issues, 0);
+  const text = renderText(siteOnly, new Set(), 0);
   assert(siteOnly.issues.every(m => text.includes(m)), 'site-level issues are printed, not just counted');
   assert(text.includes('2 issue(s) found'), 'issue count still summarised');
+
+  // The 0.1.7 bug: renderText was handed a SNAPSHOT of the issues taken before the homepage
+  // fallback ran, so a failed homepage fetch (g2.com → 403) was counted and never printed.
+  // Now anything not explicitly marked as printed inline is printed at the top.
+  const late = {
+    site: 'https://a.com', sitemap: { url: 'https://a.com/sitemap.xml', count: 0 },
+    pages: [{ url: 'https://a.com/p', problems: ['no <title>'] }], brokenLinks: [],
+    issues: ['sitemap https://a.com/sitemap.xml returned 403', 'https://a.com/ → 403 — nothing checked',
+             'https://a.com/p — no <title>'],
+  };
+  const pageIssue = 'https://a.com/p — no <title>';
+  const lateText = renderText(late, new Set([pageIssue]), 0);
+  assert(late.issues.filter(m => m !== pageIssue).every(m => lateText.includes(m)),
+    'every counted issue that is not shown inline is printed verbatim');
+  assert(lateText.includes('https://a.com/ → 403'), 'an issue raised after the sitemap stage is still printed');
+  assert(lateText.split('no <title>').length === 2, 'an issue shown next to its page is not printed twice');
+
+  // A gzipped sitemap is legal and g2.com serves one; unwrapped, the XML parse finds no
+  // <loc>s and we would report a perfectly good sitemap as empty.
+  assert(parseSitemap(decodeBody(gzipSync(Buffer.from('<urlset><loc>https://a.com/x</loc></urlset>')),
+    'application/gzip')).join() === 'https://a.com/x', 'gzipped sitemap is decompressed before parsing');
+  assert(decodeBody(new TextEncoder().encode('plain'), 'text/html') === 'plain', 'non-gzip bodies untouched');
 
   console.log('selftest: all checks passed');
   return 0;
