@@ -302,6 +302,16 @@ async function get(url, method = 'GET') {
   }
 }
 
+// HEAD is cheap but not universally served: sitecore.com answers 403 to HEAD on /search and
+// on every localised /platform/* page, and 200 to GET — so six live pages were reported as
+// broken links. A fabricated 404 is the one output that makes an owner bin the whole report,
+// so never believe a failing HEAD until a GET agrees with it.
+async function linkStatus(url, fetchOne = get) {
+  const head = await fetchOne(url, 'HEAD');
+  if (head.status > 0 && head.status < 400) return head;
+  return fetchOne(url);
+}
+
 async function mapLimit(items, limit, fn) {
   const out = new Array(items.length);
   let i = 0;
@@ -421,7 +431,7 @@ async function check(base, { limit, json }) {
   const known = new Set(urls.map(normalise));
   const unlisted = [...linkTargets].filter(l => !known.has(normalise(l)));
   const broken = (await mapLimit(unlisted.slice(0, limit), 6, async l => {
-    const res = await get(l, 'HEAD');
+    const res = await linkStatus(l);
     // wagtail.org/slack is a redirect to join.slack.com, which 403s every non-browser. Saying
     // only "wagtail.org/slack → 403" sends the owner to look at their own server for a fault
     // that is Slack's; naming the host that answered makes it a 10-second triage.
@@ -541,6 +551,22 @@ async function selftest() {
   const endless = await expandSitemapIndex(deep('https://a.com/s'), async u => deep(u), m => notes.push(m));
   assert(endless.urls.length === 0 && notes.some(n => n.includes('nests deeper')), 'depth cap stops and reports');
   assert(endless.sitemaps === INDEX_DEPTH_CAP, 'depth cap stops after exactly the capped number of levels');
+
+  // A link is only broken when GET says so — HEAD-hostile hosts must not fabricate 404s.
+  const calls = [];
+  const stub = statuses => async (u, method = 'GET') => {
+    calls.push(method);
+    return { status: statuses[method], body: '', url: u, type: '' };
+  };
+  assert((await linkStatus('https://a.com/x', stub({ HEAD: 403, GET: 200 }))).status === 200,
+    'a link that 403s HEAD but serves GET is not reported broken');
+  assert((await linkStatus('https://a.com/x', stub({ HEAD: 404, GET: 404 }))).status === 404,
+    'a genuinely dead link is still reported');
+  assert((await linkStatus('https://a.com/x', stub({ HEAD: 0, GET: 200 }))).status === 200,
+    'a HEAD that errors outright is retried with GET');
+  calls.length = 0;
+  await linkStatus('https://a.com/x', stub({ HEAD: 200, GET: 200 }));
+  assert(calls.join(',') === 'HEAD', 'a healthy HEAD costs exactly one request — no GET retry');
 
   assert(findMojibake('cafÃ© naÃ¯ve').length > 0, 'mojibake detected');
   assert(findMojibake('café naïve — clean copy').length === 0, 'clean text is not mojibake');
