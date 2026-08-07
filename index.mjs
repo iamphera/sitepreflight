@@ -142,6 +142,24 @@ export function redirectedTo(asked, res) {
   return res.url && normalise(res.url) !== normalise(asked) ? res.url : null;
 }
 
+// craftcms.com's sitemap lists /about, which 302s to the homepage. Judging the page where it
+// landed found a healthy homepage and passed it — but a sitemap URL that redirects to the site
+// root is dead content: Google files it under "Page with redirect" and never indexes it, and
+// one such URL is not a collision so collidingLandings never sees it. Only a non-root path
+// landing on root counts, so http→https and trailing-slash normalisation never trip this.
+export function redirectedToRoot(asked, finalUrl) {
+  if (!finalUrl) return null;
+  try {
+    const f = new URL(finalUrl);
+    if (new URL(asked).pathname === '/' || f.pathname !== '/') return null;
+    // finalUrl is the RAW response URL while normalise() strips query and fragment, so
+    // /product → /?p=123 and /app → /#/app both have a root pathname and are still live
+    // pages. Query- and hash-routed destinations are not the homepage.
+    if (f.search || f.hash) return null;
+  } catch { return null; }
+  return 'redirects to the site root — the page is gone; remove it from the sitemap or restore it';
+}
+
 export function collidingLandings(pages) {
   const landings = new Map();
   for (const p of pages) {
@@ -385,6 +403,8 @@ async function check(base, { limit, json }) {
     }
     // res.url, not url: the canonical and the internal links belong to the page we landed on.
     const { title, problems } = checkHtml(res.body, res.url || url);
+    const rootHop = redirectedToRoot(url, finalUrl);
+    if (rootHop) problems.unshift(rootHop);
     for (const l of internalLinks(res.body, res.url || url)) linkTargets.add(l);
     for (const p of problems) failInline(`${url}${via} — ${p}`);
     return { url, finalUrl, status: res.status, title, problems };
@@ -587,6 +607,20 @@ async function selftest() {
     { url: 'https://a.com/p', finalUrl: 'https://b.com/p' },
     { url: 'https://a.com/q', finalUrl: 'https://b.com/q' },
   ]).length === 0, 'a 1:1 host migration is not a collision');
+  // ...nor a single dead URL 302ing to the homepage, which is not a collision at all.
+  assert(redirectedToRoot('https://a.com/about', 'https://a.com/'),
+    'a sitemap URL redirecting to the site root is reported');
+  assert(redirectedToRoot('https://a.com/about', 'https://b.com/'),
+    'a cross-origin redirect to a root is reported too');
+  assert(redirectedToRoot('https://a.com/', 'https://a.com') === null,
+    'the homepage redirecting to itself is not a dead page');
+  assert(redirectedToRoot('https://a.com/about', 'https://a.com/about/') === null,
+    'a trailing-slash redirect is not a dead page');
+  assert(redirectedToRoot('https://a.com/about', null) === null, 'no redirect, no finding');
+  assert(redirectedToRoot('https://a.com/product', 'https://a.com/?p=123') === null,
+    'a query-routed destination is a live page, not the homepage');
+  assert(redirectedToRoot('https://a.com/app', 'https://a.com/#/app') === null,
+    'a hash-routed destination is a live page, not the homepage');
 
   // Unquoted attribute values are legal HTML5 and ghost.org ships them.
   const bare = `<title>T</title><meta name=description content=d>

@@ -10,6 +10,7 @@ It catches the boring things that quietly cost you traffic after a deploy:
 - missing `<title>` or meta description
 - `noindex` left on a page you meant to publish
 - `rel=canonical` missing, or pointing at a different URL
+- sitemap URLs that redirect to the homepage — dead pages Google files under "page with redirect"
 - mojibake (`cafÃ©`) from a bad encoding round-trip
 
 Pages served in a legacy charset (ISO-8859-1, Shift_JIS, windows-1251...) are decoded
