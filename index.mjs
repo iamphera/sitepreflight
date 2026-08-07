@@ -285,7 +285,24 @@ function fetchErrorReason(err) {
   return (best.code ? `${best.message} (${best.code})` : best.message) || 'fetch failed';
 }
 
-async function get(url, method = 'GET') {
+// A 429 (and a 503) is "come back later", not a verdict on the URL. natori.com's Shopify
+// login endpoint answered 429 to our own burst of requests and we printed "broken link →
+// 429" for a URL that serves 200 to the very same headers a second later. Telling an owner
+// their login link is dead because WE were throttled is the same credibility failure as a
+// fabricated 404 — so a throttle is never taken at face value.
+export const isThrottled = status => status === 429 || status === 503;
+
+// Honour Retry-After when it is a sane number of seconds; a host that asks for an hour is
+// not worth waiting for inside a pre-flight check, so clamp and move on.
+export function retryAfterMs(header, fallback = 2000) {
+  const secs = Number(header);
+  if (!Number.isFinite(secs) || secs <= 0) return fallback;
+  return Math.min(secs, 5) * 1000;
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function get(url, method = 'GET', attempt = 0) {
   try {
     // Node's default `Accept: */*` is not what a visitor sends, and some hosts refuse it:
     // Shopify's customer-account OAuth page answers 406 to */*, so hydrogen.shop/account was
@@ -293,6 +310,11 @@ async function get(url, method = 'GET') {
     // */*;q=0.8 keeps sitemaps/robots.txt acceptable, so nothing else changes.
     const headers = { 'user-agent': UA, accept: ACCEPT };
     const res = await fetch(url, { method, headers, redirect: 'follow' });
+    if (isThrottled(res.status) && attempt === 0) {
+      await res.arrayBuffer().catch(() => {}); // release the socket before sleeping on it
+      await sleep(retryAfterMs(res.headers.get('retry-after')));
+      return get(url, method, 1);
+    }
     const body = method === 'GET'
       ? decodeBody(await res.arrayBuffer(), res.headers.get('content-type'))
       : '';
@@ -435,7 +457,9 @@ async function check(base, { limit, json }) {
     // wagtail.org/slack is a redirect to join.slack.com, which 403s every non-browser. Saying
     // only "wagtail.org/slack → 403" sends the owner to look at their own server for a fault
     // that is Slack's; naming the host that answered makes it a 10-second triage.
-    return res.status >= 400 || res.status === 0
+    // Still throttling after the back-off in get(): we have no evidence the link is dead,
+    // and "broken link → 429" is a claim we cannot stand behind. Say nothing.
+    return (res.status >= 400 || res.status === 0) && !isThrottled(res.status)
       ? { url: l, status: res.status, finalUrl: redirectedTo(l, res) } : null;
   })).filter(Boolean);
   for (const b of broken) failInline(`internal link ${b.url}${b.finalUrl ? ` (redirected to ${b.finalUrl})` : ''} → ${b.status || 'unreachable'}`);
@@ -567,6 +591,15 @@ async function selftest() {
   calls.length = 0;
   await linkStatus('https://a.com/x', stub({ HEAD: 200, GET: 200 }));
   assert(calls.join(',') === 'HEAD', 'a healthy HEAD costs exactly one request — no GET retry');
+
+  // A throttle is not a dead link.
+  assert(isThrottled(429) && isThrottled(503), '429 and 503 are throttles');
+  assert(!isThrottled(404) && !isThrottled(403) && !isThrottled(500) && !isThrottled(0),
+    'a real failure status is not mistaken for a throttle');
+  assert(retryAfterMs('3') === 3000, 'Retry-After seconds honoured');
+  assert(retryAfterMs('3600') === 5000, 'an absurd Retry-After is clamped');
+  assert(retryAfterMs(null) === 2000 && retryAfterMs('Wed, 21 Oct 2026 07:28:00 GMT') === 2000,
+    'a missing or date-form Retry-After falls back');
 
   assert(findMojibake('cafÃ© naÃ¯ve').length > 0, 'mojibake detected');
   assert(findMojibake('café naïve — clean copy').length === 0, 'clean text is not mojibake');
