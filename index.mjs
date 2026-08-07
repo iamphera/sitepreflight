@@ -133,6 +133,26 @@ function normalise(u) {
   } catch { return u; }
 }
 
+// Where the response actually came from, when that is not where we asked. drupal.org is
+// mid-migration: every URL 302s to new.drupal.org and self-canonicalises there, which is
+// CORRECT — but we compared the canonical against the URL we requested, so we told them
+// "canonical points elsewhere" on every single page. A false positive of that shape on
+// every page is how an owner decides the whole report is noise.
+export function redirectedTo(asked, res) {
+  return res.url && normalise(res.url) !== normalise(asked) ? res.url : null;
+}
+
+export function collidingLandings(pages) {
+  const landings = new Map();
+  for (const p of pages) {
+    const dest = normalise(p.finalUrl || p.url);
+    landings.set(dest, [...(landings.get(dest) || []), p.url]);
+  }
+  return [...landings]
+    .filter(([, from]) => from.length > 1)
+    .map(([dest, from]) => `${from.length} URLs all redirect to ${dest} — ${from.join(', ')}`);
+}
+
 // The whitespace before `href` is load-bearing: Vue/Alpine/Angular write the DYNAMIC link as
 // `:href`, `v-bind:href`, `x-bind:href` or `[href]`, and a bare `href=` match happily lands
 // inside those. Allbirds (Shopify + Vue) served three "broken links" that were really the
@@ -303,7 +323,8 @@ async function check(base, { limit, json }) {
   const smRes = await get(sitemapUrl);
   let urls = [];
   if (smRes.status !== 200) {
-    fail(`sitemap ${sitemapUrl} returned ${smRes.status || smRes.error}`);
+    const via = redirectedTo(sitemapUrl, smRes);
+    fail(`sitemap ${sitemapUrl}${via ? ` (redirected to ${via})` : ''} returned ${smRes.status || smRes.error}`);
   } else {
     urls = parseSitemap(smRes.body);
     if (isSitemapIndex(smRes.body)) {
@@ -346,34 +367,48 @@ async function check(base, { limit, json }) {
   const linkTargets = new Set();
   report.pages = await mapLimit(targets, 6, async url => {
     const res = await get(url);
+    const finalUrl = redirectedTo(url, res);
+    const via = finalUrl ? ` (redirected to ${finalUrl})` : '';
     if (res.status !== 200) {
-      failInline(`${url} → ${res.status || res.error}`);
+      failInline(`${url}${via} → ${res.status || res.error}`);
       // "not reachable" told the customer nothing: a 404 to fix, a 403 from their own bot
       // protection, and a timeout are three different jobs. Name the status.
-      return { url, status: res.status, problems: [`returned ${res.status || res.error}`] };
+      return { url, finalUrl, status: res.status, problems: [`returned ${res.status || res.error}`] };
     }
     // allbirds.com's sitemap lists /agents.md (text/markdown). Running the HTML checks on it
     // produced three findings that a customer can do nothing useful with; the actionable
     // fact is that a non-page is in the sitemap at all.
     if (!isHtml(res.type)) {
       const p = `not an HTML page (${res.type.split(';')[0] || 'unknown type'}) — remove it from the sitemap`;
-      failInline(`${url} — ${p}`);
-      return { url, status: res.status, problems: [p] };
+      failInline(`${url}${via} — ${p}`);
+      return { url, finalUrl, status: res.status, problems: [p] };
     }
-    const { title, problems } = checkHtml(res.body, url);
-    for (const l of internalLinks(res.body, url)) linkTargets.add(l);
-    for (const p of problems) failInline(`${url} — ${p}`);
-    return { url, status: res.status, title, problems };
+    // res.url, not url: the canonical and the internal links belong to the page we landed on.
+    const { title, problems } = checkHtml(res.body, res.url || url);
+    for (const l of internalLinks(res.body, res.url || url)) linkTargets.add(l);
+    for (const p of problems) failInline(`${url}${via} — ${p}`);
+    return { url, finalUrl, status: res.status, title, problems };
   });
+
+  // Judging a page where it landed closes the false "canonical points elsewhere", but it
+  // opens a worse hole: a sitemap whose URLs all 302 to one surviving page now self-canonicals
+  // its way to ALL CLEAR, when several dead URLs collapsing onto one page is exactly the
+  // duplicate-content defect the owner needs told. Two requested URLs, one destination, is
+  // unambiguous — no heuristic about which redirects are legitimate.
+  for (const m of collidingLandings(report.pages)) fail(m);
 
   // Internal links that the sitemap never mentions are the usual source of dead ends.
   const known = new Set(urls.map(normalise));
   const unlisted = [...linkTargets].filter(l => !known.has(normalise(l)));
   const broken = (await mapLimit(unlisted.slice(0, limit), 6, async l => {
     const res = await get(l, 'HEAD');
-    return res.status >= 400 || res.status === 0 ? { url: l, status: res.status } : null;
+    // wagtail.org/slack is a redirect to join.slack.com, which 403s every non-browser. Saying
+    // only "wagtail.org/slack → 403" sends the owner to look at their own server for a fault
+    // that is Slack's; naming the host that answered makes it a 10-second triage.
+    return res.status >= 400 || res.status === 0
+      ? { url: l, status: res.status, finalUrl: redirectedTo(l, res) } : null;
   })).filter(Boolean);
-  for (const b of broken) failInline(`internal link ${b.url} → ${b.status || 'unreachable'}`);
+  for (const b of broken) failInline(`internal link ${b.url}${b.finalUrl ? ` (redirected to ${b.finalUrl})` : ''} → ${b.status || 'unreachable'}`);
   report.brokenLinks = broken;
 
   console.log(json ? JSON.stringify(report, null, 2)
@@ -397,9 +432,12 @@ function renderText(report, inline, unlistedCount) {
   for (const m of siteIssues) out.push(`  ✗ ${m}`);
   for (const p of report.pages) {
     const mark = p.problems.length ? '✗' : '✓';
-    out.push(`  ${mark} ${p.url}${p.problems.length ? '\n      ' + p.problems.join('\n      ') : ''}`);
+    const where = p.finalUrl ? `${p.url} → ${p.finalUrl}` : p.url;
+    out.push(`  ${mark} ${where}${p.problems.length ? '\n      ' + p.problems.join('\n      ') : ''}`);
   }
-  for (const b of report.brokenLinks) out.push(`  ✗ broken link ${b.url} → ${b.status || 'unreachable'}`);
+  for (const b of report.brokenLinks) {
+    out.push(`  ✗ broken link ${b.url}${b.finalUrl ? ` (redirected to ${b.finalUrl})` : ''} → ${b.status || 'unreachable'}`);
+  }
   out.push(report.issues.length ? `\n  ${report.issues.length} issue(s) found.\n` : `\n  All clear.\n`);
   return out.join('\n');
 }
@@ -527,6 +565,28 @@ async function selftest() {
     'a description tag with no content attribute is empty, not missing');
   assert(checkHtml(good.replace(' href="https://a.com/p/"', ''), 'https://a.com/p/').problems[0].includes('empty href'),
     'a canonical tag with no href attribute is empty, not missing');
+
+  // A redirected page is judged where it landed (drupal.org → new.drupal.org).
+  assert(redirectedTo('https://a.com/p', { url: 'https://b.com/p' }) === 'https://b.com/p',
+    'a cross-origin redirect is reported');
+  assert(redirectedTo('https://a.com/p', { url: 'https://a.com/p/' }) === null,
+    'a trailing slash is not a redirect worth naming');
+  assert(redirectedTo('https://a.com/p', { url: '' }) === null, 'no final URL means no redirect');
+  assert(checkHtml(`<title>T</title><meta name="description" content="d">
+    <link rel="canonical" href="https://b.com/p/">`, 'https://b.com/p/').problems.length === 0,
+    'a self-canonical on the redirect target is not "points elsewhere"');
+  // ...but judging pages where they land must not hide a sitemap collapsing onto one page.
+  const collided = collidingLandings([
+    { url: 'https://a.com/x', finalUrl: 'https://a.com/home' },
+    { url: 'https://a.com/y', finalUrl: 'https://a.com/home' },
+    { url: 'https://a.com/z', finalUrl: null },
+  ]);
+  assert(collided.length === 1 && collided[0].includes('/x') && collided[0].includes('/y'),
+    'two URLs landing on one page is reported');
+  assert(collidingLandings([
+    { url: 'https://a.com/p', finalUrl: 'https://b.com/p' },
+    { url: 'https://a.com/q', finalUrl: 'https://b.com/q' },
+  ]).length === 0, 'a 1:1 host migration is not a collision');
 
   // Unquoted attribute values are legal HTML5 and ghost.org ships them.
   const bare = `<title>T</title><meta name=description content=d>
