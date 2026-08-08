@@ -8,6 +8,19 @@
 // Exit code is 1 when any check fails, so it works as a CI gate.
 
 import { gunzipSync, gzipSync } from 'node:zlib';
+import net from 'node:net';
+
+// Happy Eyeballs gives each address family only 250ms by default. On a machine with no
+// IPv6 route (most CI runners), a host whose IPv4 handshake takes longer than that —
+// anything geographically distant — has its working v4 attempt cancelled, the v6 attempt
+// fails ENETUNREACH, and `fetch` reports ETIMEDOUT for a site that is perfectly healthy.
+// typo3.org did exactly this: curl 200, our robots.txt + sitemap + homepage all "timed out"
+// in 300ms, three fabricated failures and a red CI build on a live site. 2s is still far
+// below any real request timeout, so a genuinely dead address is not slowed down much.
+// Guarded: the API landed in Node 18.18, and package.json allows >=18.
+if (typeof net.setDefaultAutoSelectFamilyAttemptTimeout === 'function') {
+  net.setDefaultAutoSelectFamilyAttemptTimeout(2000);
+}
 
 const UA = 'sitepreflight/0.1 (+https://github.com/iamphera/sitepreflight)';
 const ACCEPT = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8';
@@ -57,6 +70,29 @@ export function canonicalOrigin(requested, finalUrl) {
     return f.protocol === r.protocol || (r.protocol === 'http:' && f.protocol === 'https:')
       ? f.origin : requested;
   } catch { return requested; }
+}
+
+// robots.txt may declare many sitemaps, and the first one is not necessarily this site's.
+// typo3.org lists four typo3.com sitemaps, then typo3.community, and only then its own —
+// taking [0] produced a whole report about typo3.com, plus "290 URLs off-origin" as the
+// headline finding on a site whose own sitemap is fine. Prefer the site's own origin
+// (www/apex counts as the same site, as it does everywhere else here); fall back to the
+// first declared one only when nothing on-origin was offered.
+// EXACT origin first, and only then a www/apex sibling: the off-origin check downstream
+// compares URL.origin strictly, so preferring www's sitemap on an apex site would report
+// every URL inside it as off-origin — re-creating the false positive this exists to kill.
+export function pickSitemap(sitemaps, origin) {
+  const home = (() => { try { return new URL(origin); } catch { return null; } })();
+  if (!home) return sitemaps[0] || null;
+  const parsed = sitemaps.map(s => {
+    try { return { s, u: new URL(s) }; } catch { return null; }
+  }).filter(Boolean);
+  const exact = parsed.find(p => p.u.origin === home.origin);
+  // A site whose robots.txt only offers the OTHER of www/apex: still its own sitemap, and
+  // still a better report than a stranger's. The off-origin line then fires honestly —
+  // an apex site listing www URLs is a real canonicalisation inconsistency.
+  const sibling = parsed.find(p => bareHost(p.u.hostname) === bareHost(home.hostname));
+  return (exact || sibling)?.s || sitemaps[0] || null;
 }
 
 export function parseRobots(txt) {
@@ -437,7 +473,7 @@ async function check(base, { limit, json }) {
     sitemapUrls = sitemaps;
   }
 
-  const sitemapUrl = sitemapUrls[0] || origin + '/sitemap.xml';
+  const sitemapUrl = pickSitemap(sitemapUrls, origin) || origin + '/sitemap.xml';
   const smRes = await get(sitemapUrl);
   let urls = [];
   if (smRes.status !== 200) {
@@ -629,6 +665,23 @@ async function selftest() {
     'a failed fetch does not move the origin');
   assert(decodeXmlEntities('&#99999999;x') === '&#99999999;x',
     'an out-of-range numeric entity is left alone rather than throwing');
+
+  // The real typo3.org shape: four other-domain sitemaps declared before its own.
+  assert(pickSitemap(['https://typo3.com/sitemap.xml', 'https://typo3.community/sitemap.xml',
+    'https://typo3.org/sitemap.xml'], 'https://typo3.org') === 'https://typo3.org/sitemap.xml',
+    'the site\'s own sitemap wins over off-origin ones declared before it');
+  assert(pickSitemap(['https://cdn.net/sitemap.xml', 'https://www.a.com/sitemap.xml',
+    'https://a.com/sitemap.xml'], 'https://a.com') === 'https://a.com/sitemap.xml',
+    'an exact-origin sitemap beats a www sibling, whose URLs would all read as off-origin');
+  assert(pickSitemap(['https://www.a.com/sitemap.xml'], 'https://a.com') === 'https://www.a.com/sitemap.xml',
+    'the other of www/apex is still this site, and beats no sitemap at all');
+  assert(pickSitemap(['https://cdn.net/sitemap.xml'], 'not a url') === 'https://cdn.net/sitemap.xml',
+    'an unparseable origin falls back to the first declared sitemap rather than throwing');
+  assert(pickSitemap(['https://cdn.net/sitemap.xml'], 'https://a.com') === 'https://cdn.net/sitemap.xml',
+    'an off-origin sitemap is still used when it is the only one offered');
+  assert(pickSitemap(['not a url', 'https://a.com/sitemap.xml'], 'https://a.com') === 'https://a.com/sitemap.xml',
+    'an unparseable Sitemap: line does not win and does not throw');
+  assert(pickSitemap([], 'https://a.com') === null, 'no declared sitemap falls back to the caller');
 
   assert(isSitemapIndex('<?xml version="1.0"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
     + '<sitemap><loc>https://a.com/sitemap-0.xml</loc></sitemap></sitemapindex>'), 'isSitemapIndex detects an index');
