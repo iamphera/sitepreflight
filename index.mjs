@@ -310,14 +310,40 @@ export function decodeBody(buf, contentType) {
 // actual reason on err.cause. potion.so's certificate had EXPIRED and all we told the owner
 // was "robots.txt returned fetch failed" three times — an expired cert is exactly the kind
 // of deploy-blocking fault this tool exists to catch, so report the deepest cause instead.
-function fetchErrorReason(err) {
+// A transport failure (status 0) is a fact about the network between US and the target, not
+// a verdict on the owner's link. getkirby.com links to plugins.getkirby.com, which this
+// checker's host cannot reach at all; five live pages were reported as "broken link →
+// unreachable" while curl fetched every one of them with 200. Claiming a working link is
+// dead is the same credibility failure as a fabricated 404.
+// The exceptions are the transport errors that ARE evidence about the target: a name that
+// does not resolve, a host that actively refuses, and a certificate that no visitor's
+// browser would accept either. Everything else — timeouts, resets, unroutable networks —
+// we cannot tell apart from our own plumbing, so we do not claim it.
+// Matched on .code, never on the message: a hostname inside the message must not decide it.
+const DEAD_HOST = /^(ENOTFOUND|EAI_NONAME|ECONNREFUSED|ERR_INVALID_URL|ERR_UNSUPPORTED_PROTOCOL|CERT_HAS_EXPIRED|ERR_TLS_CERT_ALTNAME_INVALID|DEPTH_ZERO_SELF_SIGNED_CERT|UNABLE_TO_VERIFY_LEAF_SIGNATURE|SELF_SIGNED_CERT_IN_CHAIN)$/;
+export const isDeadHost = res => res.status === 0 && DEAD_HOST.test(res.code || '');
+export const isOurNetwork = res => res.status === 0 && !isDeadHost(res);
+
+// Node wraps dual-stack connect failures in an AggregateError whose own message is empty
+// and whose real reasons hang off .errors, not .cause. Skipping it left every such failure
+// as the bare "fetch failed", which is exactly the case where the code (ETIMEDOUT vs
+// ENOTFOUND) decides whether the link is the owner's problem or ours. And the two branches
+// of a dual stack routinely disagree — v6 ENETUNREACH beside v4 CERT_HAS_EXPIRED — so take
+// the decisive one rather than whichever Node happened to list first.
+function bestCause(err) {
   let c = err, best = err;
-  for (let depth = 0; c.cause && depth < 5; depth++) { // depth cap: cause chains can cycle
-    c = c.cause;
-    // Node wraps dual-stack connect failures in an AggregateError whose own message is
-    // empty; taking it blindly would print "robots.txt returned " and say even less.
+  for (let depth = 0; depth < 5; depth++) { // depth cap: cause chains can cycle
+    const kids = Array.isArray(c.errors) ? c.errors : [];
+    const next = c.cause || kids.find(e => DEAD_HOST.test(e?.code || '')) || kids[0];
+    if (!next) break;
+    c = next;
     if (c.message) best = c;
   }
+  return best;
+}
+
+function fetchErrorReason(err) {
+  const best = bestCause(err);
   return (best.code ? `${best.message} (${best.code})` : best.message) || 'fetch failed';
 }
 
@@ -356,7 +382,8 @@ async function get(url, method = 'GET', attempt = 0) {
       : '';
     return { status: res.status, body, url: res.url, type: res.headers.get('content-type') || '' };
   } catch (err) {
-    return { status: 0, body: '', url, type: '', error: fetchErrorReason(err) };
+    const cause = bestCause(err);
+    return { status: 0, body: '', url, type: '', error: fetchErrorReason(err), code: cause.code || '' };
   }
 }
 
@@ -493,18 +520,26 @@ async function check(base, { limit, json }) {
   // Internal links that the sitemap never mentions are the usual source of dead ends.
   const known = new Set(urls.map(normalise));
   const unlisted = [...linkTargets].filter(l => !known.has(normalise(l)));
-  const broken = (await mapLimit(unlisted.slice(0, limit), 6, async l => {
+  const checked = (await mapLimit(unlisted.slice(0, limit), 6, async l => {
     const res = await linkStatus(l);
     // wagtail.org/slack is a redirect to join.slack.com, which 403s every non-browser. Saying
     // only "wagtail.org/slack → 403" sends the owner to look at their own server for a fault
     // that is Slack's; naming the host that answered makes it a 10-second triage.
     // Still throttling after the back-off in get(): we have no evidence the link is dead,
     // and "broken link → 429" is a claim we cannot stand behind. Say nothing.
-    return (res.status >= 400 || res.status === 0) && !isThrottled(res.status)
-      ? { url: l, status: res.status, finalUrl: redirectedTo(l, res) } : null;
+    if (isThrottled(res.status)) return null;
+    if (res.status < 400 && res.status > 0) return null;
+    const hit = { url: l, status: res.status, error: res.error, code: res.code, finalUrl: redirectedTo(l, res) };
+    return isOurNetwork(res) ? { ...hit, unverified: true } : hit;
   })).filter(Boolean);
-  for (const b of broken) failInline(`internal link ${b.url}${b.finalUrl ? ` (redirected to ${b.finalUrl})` : ''} → ${b.status || 'unreachable'}`);
+  const broken = checked.filter(b => !b.unverified);
+  // Never counted as an issue: a timeout or a reset would otherwise fail a customer's build
+  // for a fault on our side. Named anyway — "unreachable" threw away the one diagnostic we
+  // had, and silence would hide a link we genuinely did not check.
+  const unverified = checked.filter(b => b.unverified);
+  for (const b of broken) failInline(`internal link ${b.url}${b.finalUrl ? ` (redirected to ${b.finalUrl})` : ''} → ${b.status || b.error}`);
   report.brokenLinks = broken;
+  report.unverifiedLinks = unverified;
 
   console.log(json ? JSON.stringify(report, null, 2)
                    : renderText(report, inline, unlisted.length));
@@ -531,7 +566,10 @@ function renderText(report, inline, unlistedCount) {
     out.push(`  ${mark} ${where}${p.problems.length ? '\n      ' + p.problems.join('\n      ') : ''}`);
   }
   for (const b of report.brokenLinks) {
-    out.push(`  ✗ broken link ${b.url}${b.finalUrl ? ` (redirected to ${b.finalUrl})` : ''} → ${b.status || 'unreachable'}`);
+    out.push(`  ✗ broken link ${b.url}${b.finalUrl ? ` (redirected to ${b.finalUrl})` : ''} → ${b.status || b.error}`);
+  }
+  for (const b of report.unverifiedLinks || []) {
+    out.push(`  ? ${b.url} — could not be reached from this machine (${b.error}); not counted, verify it yourself`);
   }
   out.push(report.issues.length ? `\n  ${report.issues.length} issue(s) found.\n` : `\n  All clear.\n`);
   return out.join('\n');
@@ -663,6 +701,33 @@ async function selftest() {
   calls.length = 0;
   await linkStatus('https://a.com/x', stub({ HEAD: 200, GET: 200 }));
   assert(calls.join(',') === 'HEAD', 'a healthy HEAD costs exactly one request — no GET retry');
+
+  // Our own network failing is not the owner's broken link.
+  const err = code => ({ status: 0, code });
+  assert(isOurNetwork(err('ETIMEDOUT')), 'a timeout is our side, not a dead link');
+  assert(isOurNetwork(err('ECONNRESET')) && isOurNetwork(err('ENETUNREACH')),
+    'a reset or an unroutable network is our side');
+  assert(isDeadHost(err('ENOTFOUND')) && !isOurNetwork(err('ENOTFOUND')),
+    'a host that does not resolve really is a dead link');
+  assert(isDeadHost(err('ECONNREFUSED')) && isDeadHost(err('CERT_HAS_EXPIRED')),
+    'a refused connection and an expired certificate are the owner\'s, not ours');
+  assert(!isOurNetwork({ status: 404 }) && !isDeadHost({ status: 404 }),
+    'a real HTTP status is judged on the status, not the transport');
+  assert(isOurNetwork({ status: 0, code: '' }) && isOurNetwork({ status: 0 }),
+    'a transport failure with no reason defaults to our side, never to a broken claim');
+  // The code decides, not the message — a hostname that merely contains the token must not.
+  assert(isOurNetwork({ status: 0, code: 'ETIMEDOUT', error: 'connect to enotfound.example' }),
+    'a dead-host token inside the message text never promotes a timeout to a broken link');
+
+  // Dual-stack: the decisive branch wins over whichever Node listed first.
+  const agg = Object.assign(new Error('fetch failed'), {
+    cause: Object.assign(new AggregateError([
+      Object.assign(new Error('connect ENETUNREACH'), { code: 'ENETUNREACH' }),
+      Object.assign(new Error('certificate has expired'), { code: 'CERT_HAS_EXPIRED' }),
+    ], '')),
+  });
+  assert(bestCause(agg).code === 'CERT_HAS_EXPIRED',
+    'an AggregateError yields the branch that decides, not errors[0]');
 
   // A throttle is not a dead link.
   assert(isThrottled(429) && isThrottled(503), '429 and 503 are throttles');
