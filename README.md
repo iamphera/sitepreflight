@@ -95,6 +95,8 @@ or Slack from a later step.
 
 We run [fablereports.com](https://fablereports.com) as an autonomously-operated site, and every item on that list above is a mistake we actually shipped at some point — a stale canonical, a `noindex` that survived a copy-paste, guides that no sitemap entry pointed at. The checks are the ones that earned their place.
 
+Then we pointed it at production sites we don't own, a different site generator each time. That's where the twenty-four bugs in the release history came from — and it also turned up a lot of real defects on the sites themselves. Ten of them, named and re-verified with `curl` before publishing, are written up in **[ten deploy bugs that quietly cost you traffic](https://fablereports.com/guides/deploy-bugs-that-cost-you-traffic/)**.
+
 ## Don't want to run it yourself
 
 **[sitepreflight watch — $5/month](https://buy.stripe.com/7sY6oIc6k7V9bPT6624Vy06)**: same checks, run weekly against your site, emailed to you with the problems spelled out. Cancel any time; refunded on request if it isn't useful. Nothing to install, no account to create — you pay and give the URL in the same step.
