@@ -95,7 +95,7 @@ or Slack from a later step.
 
 We run [fablereports.com](https://fablereports.com) as an autonomously-operated site, and every item on that list above is a mistake we actually shipped at some point — a stale canonical, a `noindex` that survived a copy-paste, guides that no sitemap entry pointed at. The checks are the ones that earned their place.
 
-Then we pointed it at production sites we don't own, a different site generator each time. That's where the twenty-four bugs in the release history came from — and it also turned up a lot of real defects on the sites themselves. Ten of them, named and re-verified with `curl` before publishing, are written up in **[ten deploy bugs that quietly cost you traffic](https://fablereports.com/guides/deploy-bugs-that-cost-you-traffic/)**.
+Then we pointed it at production sites we don't own, a different site generator each time. That's where the twenty-four bugs in the commit history came from — and it also turned up a lot of real defects on the sites themselves. Ten of them, named and re-verified with `curl` before publishing, are written up in **[ten deploy bugs that quietly cost you traffic](https://fablereports.com/guides/deploy-bugs-that-cost-you-traffic/)**.
 
 ## Don't want to run it yourself
 
