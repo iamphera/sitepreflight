@@ -128,6 +128,25 @@ export function isHtml(contentType) {
   return !t || t === 'text/html' || t === 'application/xhtml+xml';
 }
 
+// Search engines index these file types, so listing them in a sitemap is correct and telling
+// the owner to remove them is bad advice — dfg.de has 2,658 PDFs in its sitemap on purpose.
+// They have no <title>/description/canonical to check, so they pass without HTML findings.
+// text/xml and text/markdown are NOT here: those are files that leaked into a page sitemap.
+const INDEXABLE_DOCS = new Set([
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-powerpoint',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/rtf',
+  'text/plain',
+  'text/csv',
+]);
+export const isIndexableDoc = contentType =>
+  INDEXABLE_DOCS.has((contentType || '').split(';')[0].trim().toLowerCase());
+
 // HTML5 allows unquoted attribute values and real sites ship them: ghost.org serves
 // `<link rel="canonical" href=https://ghost.org/about/>`, so a quotes-only regex reported
 // "no rel=canonical" on six pages that all had one. Telling a paying customer to add a tag
@@ -546,6 +565,9 @@ async function check(base, { limit, json }) {
     // produced three findings that a customer can do nothing useful with; the actionable
     // fact is that a non-page is in the sitemap at all.
     if (!isHtml(res.type)) {
+      // A PDF in a sitemap is not a defect — search engines index it. Only flag types that
+      // cannot be a search result at all (text/xml, text/markdown, a stray JSON feed).
+      if (isIndexableDoc(res.type)) return { url, finalUrl, status: res.status, problems: [] };
       const p = `not an HTML page (${res.type.split(';')[0] || 'unknown type'}) — remove it from the sitemap`;
       failInline(`${url}${via} — ${p}`);
       return { url, finalUrl, status: res.status, problems: [p] };
@@ -941,6 +963,12 @@ async function selftest() {
 
   assert(isHtml('text/html; charset=utf-8') && isHtml('') && isHtml(null), 'html and unknown types are checked');
   assert(!isHtml('text/markdown; charset=utf-8') && !isHtml('application/pdf'), 'non-HTML sitemap entries are not run through the HTML checks');
+
+  assert(isIndexableDoc('application/pdf') && isIndexableDoc('application/pdf; charset=binary'),
+    'a PDF in a sitemap is indexable, not a defect to remove');
+  assert(!isIndexableDoc('text/xml; charset=utf-8') && !isIndexableDoc('text/markdown')
+    && !isIndexableDoc('application/json') && !isIndexableDoc('') && !isIndexableDoc(null),
+    'XML/markdown/JSON/unknown in a page sitemap are still flagged');
 
   const seeded = seedFromHome('<a href="/">home</a><a href="/a">1</a><a href="https://x.com/b">2</a>', 'https://a.com');
   assert(seeded.join(',') === 'https://a.com/,https://a.com/a', 'seedFromHome leads with home, dedupes it, drops off-origin');

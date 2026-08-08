@@ -1,6 +1,6 @@
 {
   "name": "sitepreflight",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Pre-flight checks for a static site: sitemap, canonicals, noindex, broken internal links, mojibake \u2014 then ping IndexNow. Zero dependencies.",
   "type": "module",
   "bin": {
