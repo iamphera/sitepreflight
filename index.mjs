@@ -16,14 +16,39 @@ const INDEX_DEPTH_CAP = 3;
 
 // ---------- pure helpers (covered by --selftest) ----------
 
+// A <loc> holds XML, not a URL: a query string is REQUIRED to arrive as
+// "?type=pages&amp;page=1". Requesting that literally is a different URL, and
+// BigCommerce's sitemap index (saddlebackleather.com) 404s on every one of them —
+// five fabricated dead sitemaps from a file that is perfectly valid.
+// One pass, so "&amp;lt;" decodes to "&lt;" and not to "<".
+export function decodeXmlEntities(s) {
+  return s.replace(/&(?:#(\d+)|#x([0-9a-f]+)|(amp|lt|gt|quot|apos));/gi, (m, dec, hex, name) => {
+    if (dec) return String.fromCodePoint(Number(dec));
+    if (hex) return String.fromCodePoint(parseInt(hex, 16));
+    return { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }[name.toLowerCase()];
+  });
+}
+
 export function parseSitemap(xml) {
-  return [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map(m => m[1]);
+  return [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map(m => decodeXmlEntities(m[1]));
 }
 
 // A <sitemapindex> lists other sitemaps, not pages. Astro, Next.js and Yoast all emit one
 // by default, so treating its <loc>s as pages means checking XML files for a <title>.
 export function isSitemapIndex(xml) {
   return /<sitemapindex[\s>]/i.test(xml);
+}
+
+// Adopt a redirected origin only for the www/apex and http→https cases — those are the same
+// site under another name. A robots.txt redirected to an unrelated host is NOT the site
+// moving house, and a failed fetch (url echoed back) must not move the goalposts either.
+const bareHost = h => h.replace(/^www\./i, '');
+export function canonicalOrigin(requested, finalUrl) {
+  try {
+    const f = new URL(finalUrl), r = new URL(requested);
+    if (f.pathname !== '/robots.txt') return requested;
+    return bareHost(f.hostname) === bareHost(r.hostname) ? f.origin : requested;
+  } catch { return requested; }
 }
 
 export function parseRobots(txt) {
@@ -67,10 +92,13 @@ export function isHtml(contentType) {
 // Quoted forms are tried first: a quoted value may contain the text `href=`, and preferring
 // the quoted match means `<a title="see href=/evil" href="/real">` resolves to /real.
 export function attrValue(tag, name) {
+  // Entity-decoded for the same reason as <loc>: an HTML attribute is markup, so a link to
+  // /search?a=1&b=2 is REQUIRED to be written href="/search?a=1&amp;b=2". Fetching it
+  // literally asks for a different URL and invents a dead link.
   const q = tag.match(new RegExp(`\\s${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, 'i'));
-  if (q) return q[1] !== undefined ? q[1] : q[2];
+  if (q) return decodeXmlEntities(q[1] !== undefined ? q[1] : q[2]);
   const u = tag.match(new RegExp(`\\s${name}\\s*=\\s*([^\\s"'\`=<>]+)`, 'i'));
-  return u ? u[1] : undefined;
+  return u ? decodeXmlEntities(u[1]) : undefined;
 }
 
 // A `>` inside a quoted value does NOT close the tag: `content="Compare A > B"` truncated a
@@ -349,7 +377,7 @@ async function mapLimit(items, limit, fn) {
 // ---------- commands ----------
 
 async function check(base, { limit, json }) {
-  const origin = new URL(base).origin;
+  let origin = new URL(base).origin;
   const report = { site: origin, pages: [], issues: [], checkedAt: new Date().toISOString() };
   const fail = msg => report.issues.push(msg);
   // Issues printed next to their own page/link below. Everything else has to be printed by
@@ -359,6 +387,11 @@ async function check(base, { limit, json }) {
   const failInline = msg => { inline.add(msg); fail(msg); };
 
   const robotsRes = await get(origin + '/robots.txt');
+  // Ask for www.saddlebackleather.com, land on saddlebackleather.com: the site's real origin
+  // is the one it redirects to, and its sitemap lists that one. Comparing against the origin
+  // we happened to TYPE reported all 807 URLs as off-origin on a site with nothing wrong.
+  origin = canonicalOrigin(origin, robotsRes.url);
+  report.site = origin;
   let sitemapUrls = [];
   if (robotsRes.status !== 200) {
     fail(`robots.txt returned ${robotsRes.status || robotsRes.error}`);
@@ -519,6 +552,30 @@ async function selftest() {
 
   assert(parseSitemap('<url><loc>https://a.com/x</loc></url><url><loc> https://a.com/y </loc></url>')
     .join(',') === 'https://a.com/x,https://a.com/y', 'parseSitemap');
+
+  // A <loc> or an href is markup: "&amp;" on the wire means "&" in the URL.
+  assert(parseSitemap('<loc>https://a.com/s.php?type=pages&amp;page=1</loc>')[0]
+    === 'https://a.com/s.php?type=pages&page=1', 'parseSitemap decodes &amp; in a query string');
+  assert(decodeXmlEntities('a&#38;b&#x26;c&quot;d&apos;e&lt;f&gt;g') === 'a&b&c"d\'e<f>g',
+    'named, decimal and hex entities all decode');
+  assert(decodeXmlEntities('&amp;lt;') === '&lt;', 'one pass only — &amp;lt; is not <');
+  assert(decodeXmlEntities('a&nbsp;b&notanentity;') === 'a&nbsp;b&notanentity;',
+    'unknown entities are left alone rather than mangled');
+  assert(attrValue('<a href="/search?a=1&amp;b=2">', 'href') === '/search?a=1&b=2',
+    'attrValue decodes an entity-escaped href');
+
+  assert(canonicalOrigin('https://www.a.com', 'https://a.com/robots.txt') === 'https://a.com',
+    'www redirecting to apex moves the origin');
+  assert(canonicalOrigin('https://a.com', 'https://www.a.com/robots.txt') === 'https://www.a.com',
+    'apex redirecting to www moves the origin');
+  assert(canonicalOrigin('http://a.com', 'https://a.com/robots.txt') === 'https://a.com',
+    'an http to https upgrade moves the origin');
+  assert(canonicalOrigin('https://a.com', 'https://cdn.example.net/robots.txt') === 'https://a.com',
+    'an unrelated host does not move the origin');
+  assert(canonicalOrigin('https://a.com', 'https://a.com/404.html') === 'https://a.com',
+    'landing somewhere other than robots.txt does not move the origin');
+  assert(canonicalOrigin('https://a.com', undefined) === 'https://a.com',
+    'a failed fetch does not move the origin');
 
   assert(isSitemapIndex('<?xml version="1.0"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
     + '<sitemap><loc>https://a.com/sitemap-0.xml</loc></sitemap></sitemapindex>'), 'isSitemapIndex detects an index');
