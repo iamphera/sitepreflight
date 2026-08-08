@@ -400,6 +400,14 @@ export function retryAfterMs(header, fallback = 2000) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// What we say about a page that did not answer 200. A 429 survived the retry in get(), so it
+// is still an issue — silently passing a page we never read would be worse. But bubble.io
+// answered 429 to all six sitemap pages, and to a single spaced-out curl too: that is rate
+// limiting, not six broken pages. Name which it is, or the owner hunts a defect that is not
+// there — the same credibility failure as a fabricated 404.
+export const statusProblem = res => `returned ${res.status || res.error}`
+  + (isThrottled(res.status) ? ' — rate limited, not necessarily a page defect' : '');
+
 async function get(url, method = 'GET', attempt = 0) {
   try {
     // Node's default `Accept: */*` is not what a visitor sends, and some hosts refuse it:
@@ -465,7 +473,7 @@ async function check(base, { limit, json }) {
   report.site = origin;
   let sitemapUrls = [];
   if (robotsRes.status !== 200) {
-    fail(`robots.txt returned ${robotsRes.status || robotsRes.error}`);
+    fail(`robots.txt ${statusProblem(robotsRes)}`);
   } else {
     const { sitemaps, blocksAll } = parseRobots(robotsRes.body);
     if (blocksAll) fail('robots.txt disallows / for all crawlers — nothing will be indexed');
@@ -478,13 +486,13 @@ async function check(base, { limit, json }) {
   let urls = [];
   if (smRes.status !== 200) {
     const via = redirectedTo(sitemapUrl, smRes);
-    fail(`sitemap ${sitemapUrl}${via ? ` (redirected to ${via})` : ''} returned ${smRes.status || smRes.error}`);
+    fail(`sitemap ${sitemapUrl}${via ? ` (redirected to ${via})` : ''} ${statusProblem(smRes)}`);
   } else {
     urls = parseSitemap(smRes.body);
     if (isSitemapIndex(smRes.body)) {
       const expanded = await expandSitemapIndex(smRes.body, async u => {
         const r = await get(u);
-        if (r.status !== 200) { fail(`sitemap ${u} returned ${r.status || r.error}`); return null; }
+        if (r.status !== 200) { fail(`sitemap ${u} ${statusProblem(r)}`); return null; }
         return r.body;
       }, m => console.log('  note: ' + m));
       urls = expanded.urls;
@@ -524,10 +532,15 @@ async function check(base, { limit, json }) {
     const finalUrl = redirectedTo(url, res);
     const via = finalUrl ? ` (redirected to ${finalUrl})` : '';
     if (res.status !== 200) {
-      failInline(`${url}${via} → ${res.status || res.error}`);
       // "not reachable" told the customer nothing: a 404 to fix, a 403 from their own bot
       // protection, and a timeout are three different jobs. Name the status.
-      return { url, finalUrl, status: res.status, problems: [`returned ${res.status || res.error}`] };
+      // A 429 survived the retry in get(), so it is still reported — silently passing a page
+      // we never read would be worse. But bubble.io answered 429 to every page (and to a
+      // single spaced-out curl), which is rate limiting, not six broken pages. Say which it
+      // is, or the owner goes looking for a defect that is not there.
+      const p = statusProblem(res);
+      failInline(`${url}${via} → ${p.slice('returned '.length)}`);
+      return { url, finalUrl, status: res.status, problems: [p] };
     }
     // allbirds.com's sitemap lists /agents.md (text/markdown). Running the HTML checks on it
     // produced three findings that a customer can do nothing useful with; the actionable
@@ -790,6 +803,12 @@ async function selftest() {
   assert(retryAfterMs('3600') === 5000, 'an absurd Retry-After is clamped');
   assert(retryAfterMs(null) === 2000 && retryAfterMs('Wed, 21 Oct 2026 07:28:00 GMT') === 2000,
     'a missing or date-form Retry-After falls back');
+  assert(statusProblem({ status: 429 }).includes('rate limited'),
+    'a throttled page says it was throttled, not that it is broken');
+  assert(statusProblem({ status: 404 }) === 'returned 404',
+    'a real failure status is reported bare, with no throttle excuse');
+  assert(statusProblem({ status: 0, error: 'fetch failed' }) === 'returned fetch failed',
+    'a transport failure still names its reason');
 
   assert(findMojibake('cafÃ© naÃ¯ve').length > 0, 'mojibake detected');
   assert(findMojibake('café naïve — clean copy').length === 0, 'clean text is not mojibake');
