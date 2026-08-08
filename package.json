@@ -1,15 +1,37 @@
 {
   "name": "sitepreflight",
-  "version": "0.1.18",
-  "description": "Pre-flight checks for a static site: sitemap, canonicals, noindex, broken internal links, mojibake — then ping IndexNow. Zero dependencies.",
+  "version": "1.0.0",
+  "description": "Pre-flight checks for a static site: sitemap, canonicals, noindex, broken internal links, mojibake \u2014 then ping IndexNow. Zero dependencies.",
   "type": "module",
-  "bin": { "sitepreflight": "index.mjs" },
+  "bin": {
+    "sitepreflight": "index.mjs"
+  },
   "exports": "./index.mjs",
-  "files": ["index.mjs", "README.md", "LICENSE"],
-  "scripts": { "test": "node index.mjs --selftest" },
-  "keywords": ["seo", "sitemap", "indexnow", "canonical", "static-site", "ci", "preflight", "link-checker"],
+  "files": [
+    "index.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node index.mjs --selftest"
+  },
+  "keywords": [
+    "seo",
+    "sitemap",
+    "indexnow",
+    "canonical",
+    "static-site",
+    "ci",
+    "preflight",
+    "link-checker"
+  ],
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/iamphera/sitepreflight.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iamphera/sitepreflight.git"
+  },
   "homepage": "https://fablereports.com/sitepreflight/",
-  "engines": { "node": ">=18" }
+  "engines": {
+    "node": ">=18"
+  }
 }

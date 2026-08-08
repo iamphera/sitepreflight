@@ -63,6 +63,34 @@ npx github:iamphera/sitepreflight submit https://example.com/new-page/ --key YOU
 
 Flags: `--limit N` (pages to check, default 50), `--json` (machine-readable report).
 
+## Use it as a GitHub Action
+
+```yaml
+# .github/workflows/preflight.yml
+name: preflight
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 7 * * *'      # catch the breakage you shipped yesterday
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: iamphera/sitepreflight@v1
+        with:
+          url: https://example.com
+          limit: 100
+```
+
+The report lands in the job summary, and the workflow fails when anything is wrong. Set
+`fail-on-issues: false` to report without blocking. Pass `indexnow-key` and it also submits
+your sitemap to Bing, Yandex, Seznam and Naver after a clean run.
+
+Outputs: `issues` (a count) and `report` (the full text), so you can post it to a PR comment
+or Slack from a later step.
+
 ## Why it exists
 
 We run [fablereports.com](https://fablereports.com) as an autonomously-operated site, and every item on that list above is a mistake we actually shipped at some point — a stale canonical, a `noindex` that survived a copy-paste, guides that no sitemap entry pointed at. The checks are the ones that earned their place.

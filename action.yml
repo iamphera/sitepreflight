@@ -1,0 +1,69 @@
+name: 'Site Preflight'
+description: 'Fail the build when a deploy breaks your sitemap, canonicals, indexability or internal links — then ping IndexNow.'
+author: 'Fable Reports'
+branding:
+  icon: 'check-circle'
+  color: 'yellow'
+
+inputs:
+  url:
+    description: 'Site to check, e.g. https://example.com'
+    required: true
+  limit:
+    description: 'Maximum pages to check from the sitemap'
+    required: false
+    default: '50'
+  fail-on-issues:
+    description: 'Fail the workflow when issues are found. Set false to report without blocking.'
+    required: false
+    default: 'true'
+  indexnow-key:
+    description: 'IndexNow key. When set, submits the sitemap URLs to Bing/Yandex/Seznam/Naver after a clean check.'
+    required: false
+    default: ''
+
+outputs:
+  issues:
+    description: 'Number of issues found'
+    value: ${{ steps.check.outputs.issues }}
+  report:
+    description: 'The full report as text'
+    value: ${{ steps.check.outputs.report }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: check
+      shell: bash
+      run: |
+        set -o pipefail
+        REPORT_FILE="$(mktemp)"
+        # ${{ github.action_path }} is this action's checkout — run the pinned code,
+        # not whatever npx would resolve today.
+        node "${{ github.action_path }}/index.mjs" check "${{ inputs.url }}" \
+          --limit "${{ inputs.limit }}" 2>&1 | tee "$REPORT_FILE" || true
+        ISSUES=$(grep -oE '^[[:space:]]+([0-9]+) issue' "$REPORT_FILE" | grep -oE '[0-9]+' | head -1)
+        ISSUES="${ISSUES:-0}"
+        echo "issues=$ISSUES" >>"$GITHUB_OUTPUT"
+        {
+          echo 'report<<SITEPREFLIGHT_EOF'
+          cat "$REPORT_FILE"
+          echo 'SITEPREFLIGHT_EOF'
+        } >>"$GITHUB_OUTPUT"
+        {
+          echo '## Site preflight'
+          echo
+          echo '```'
+          cat "$REPORT_FILE"
+          echo '```'
+        } >>"$GITHUB_STEP_SUMMARY"
+
+        if [ -n "${{ inputs.indexnow-key }}" ] && [ "$ISSUES" = "0" ]; then
+          node "${{ github.action_path }}/index.mjs" submit "${{ inputs.url }}" \
+            --key "${{ inputs.indexnow-key }}" || true
+        fi
+
+        if [ "${{ inputs.fail-on-issues }}" = "true" ] && [ "$ISSUES" != "0" ]; then
+          echo "::error::site preflight found $ISSUES issue(s) — see the job summary"
+          exit 1
+        fi
