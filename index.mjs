@@ -23,8 +23,12 @@ const INDEX_DEPTH_CAP = 3;
 // One pass, so "&amp;lt;" decodes to "&lt;" and not to "<".
 export function decodeXmlEntities(s) {
   return s.replace(/&(?:#(\d+)|#x([0-9a-f]+)|(amp|lt|gt|quot|apos));/gi, (m, dec, hex, name) => {
-    if (dec) return String.fromCodePoint(Number(dec));
-    if (hex) return String.fromCodePoint(parseInt(hex, 16));
+    // fromCodePoint throws RangeError above 0x10FFFF, and the input is a stranger's markup:
+    // one "&#99999999;" in one <loc> would abort the entire check with a stack trace.
+    if (dec || hex) {
+      const n = dec ? Number(dec) : parseInt(hex, 16);
+      return n <= 0x10ffff ? String.fromCodePoint(n) : m;
+    }
     return { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }[name.toLowerCase()];
   });
 }
@@ -47,7 +51,11 @@ export function canonicalOrigin(requested, finalUrl) {
   try {
     const f = new URL(finalUrl), r = new URL(requested);
     if (f.pathname !== '/robots.txt') return requested;
-    return bareHost(f.hostname) === bareHost(r.hostname) ? f.origin : requested;
+    if (bareHost(f.hostname) !== bareHost(r.hostname) || f.port !== r.port) return requested;
+    // An https→http DOWNGRADE would re-create the very bug this exists to fix: every https
+    // URL in the sitemap would then read as off-origin. Upgrade or same scheme only.
+    return f.protocol === r.protocol || (r.protocol === 'http:' && f.protocol === 'https:')
+      ? f.origin : requested;
   } catch { return requested; }
 }
 
@@ -574,8 +582,15 @@ async function selftest() {
     'an unrelated host does not move the origin');
   assert(canonicalOrigin('https://a.com', 'https://a.com/404.html') === 'https://a.com',
     'landing somewhere other than robots.txt does not move the origin');
-  assert(canonicalOrigin('https://a.com', undefined) === 'https://a.com',
+  assert(canonicalOrigin('https://a.com', 'http://a.com/robots.txt') === 'https://a.com',
+    'an https to http downgrade does not move the origin');
+  assert(canonicalOrigin('https://a.com', 'https://a.com:8443/robots.txt') === 'https://a.com',
+    'a different port does not move the origin');
+  // get()'s catch echoes the requested URL back, so this is the real failed-fetch shape.
+  assert(canonicalOrigin('https://a.com', 'https://a.com/robots.txt') === 'https://a.com',
     'a failed fetch does not move the origin');
+  assert(decodeXmlEntities('&#99999999;x') === '&#99999999;x',
+    'an out-of-range numeric entity is left alone rather than throwing');
 
   assert(isSitemapIndex('<?xml version="1.0"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
     + '<sitemap><loc>https://a.com/sitemap-0.xml</loc></sitemap></sitemapindex>'), 'isSitemapIndex detects an index');
