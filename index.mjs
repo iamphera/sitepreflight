@@ -81,6 +81,23 @@ export function canonicalOrigin(requested, finalUrl) {
 // EXACT origin first, and only then a www/apex sibling: the off-origin check downstream
 // compares URL.origin strictly, so preferring www's sitemap on an apex site would report
 // every URL inside it as off-origin — re-creating the false positive this exists to kill.
+// docs.readthedocs.io keeps serving its own robots.txt (200, no redirect) while the docs
+// themselves have moved to docs.readthedocs.com — so canonicalOrigin above sees nothing and
+// every URL in the sitemap reads as off-origin on a site that is merely mid-migration.
+// The discriminator is the ROOT redirect, not the hostname: typo3.org listing typo3.com
+// sitemaps is a genuine mistake and its root does not move. Only claim a move when EVERY
+// listed URL sits on one single other origin; the caller then has to confirm it by redirect.
+export function movedOrigin(urls, origin) {
+  if (!urls.length) return null;
+  const origins = new Set();
+  for (const u of urls) {
+    try { origins.add(new URL(u).origin); } catch { return null; }
+  }
+  if (origins.size !== 1) return null;
+  const [only] = origins;
+  return only === origin ? null : only;
+}
+
 export function pickSitemap(sitemaps, origin) {
   const home = (() => { try { return new URL(origin); } catch { return null; } })();
   if (!home) return sitemaps[0] || null;
@@ -537,6 +554,20 @@ async function check(base, { limit, json }) {
       : isBotWall(smRes.body)
         ? `sitemap ${sitemapUrl} returned 200 but served a bot-protection page, not a sitemap — allow this checker through your WAF, or the crawlers it stands in for are seeing the same wall`
         : `sitemap ${sitemapUrl} returned 200 but the body is not a readable sitemap`);
+    // Confirm a suspected move by asking the root where it goes. One extra fetch, and only
+    // on a site that would otherwise get a wall of off-origin noise.
+    const moved = movedOrigin(urls, origin);
+    if (moved) {
+      const root = await get(origin + '/');
+      let landed = null;
+      try { landed = new URL(root.url).origin; } catch {}
+      if (landed === moved) {
+        console.log(`  note: ${origin} redirects to ${moved} — checking there`);
+        origin = moved;
+        report.site = origin;
+        report.movedFrom = base;
+      }
+    }
     const foreign = urls.filter(u => { try { return new URL(u).origin !== origin; } catch { return true; } });
     if (foreign.length) fail(`sitemap lists ${foreign.length} URL(s) off-origin, e.g. ${foreign[0]}`);
   }
@@ -722,6 +753,19 @@ async function selftest() {
     'a failed fetch does not move the origin');
   assert(decodeXmlEntities('&#99999999;x') === '&#99999999;x',
     'an out-of-range numeric entity is left alone rather than throwing');
+
+  // The real docs.readthedocs.io shape: robots.txt stays put, the whole sitemap has moved.
+  assert(movedOrigin(['https://docs.readthedocs.com/', 'https://docs.readthedocs.com/a'],
+    'https://docs.readthedocs.io') === 'https://docs.readthedocs.com',
+    'a sitemap entirely on one other origin is a suspected move');
+  assert(movedOrigin(['https://a.com/x', 'https://a.com/y'], 'https://a.com') === null,
+    'a sitemap on our own origin is not a move');
+  // A few strays among our own URLs is a real off-origin mistake, not a migration.
+  assert(movedOrigin(['https://a.com/x', 'https://cdn.net/y'], 'https://a.com') === null,
+    'a mixed sitemap is not a move');
+  assert(movedOrigin(['/relative'], 'https://a.com') === null,
+    'an unparseable entry never claims a move');
+  assert(movedOrigin([], 'https://a.com') === null, 'an empty sitemap is not a move');
 
   // The real typo3.org shape: four other-domain sitemaps declared before its own.
   assert(pickSitemap(['https://typo3.com/sitemap.xml', 'https://typo3.community/sitemap.xml',
