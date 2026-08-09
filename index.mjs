@@ -147,6 +147,19 @@ const INDEXABLE_DOCS = new Set([
 export const isIndexableDoc = contentType =>
   INDEXABLE_DOCS.has((contentType || '').split(';')[0].trim().toLowerCase());
 
+// A WAF interstitial served with HTTP 200 is not the customer's page. silverstripe.org
+// answers every request (Chrome UA included) with a 948-byte Incapsula shim carrying
+// `<META NAME="ROBOTS" CONTENT="NOINDEX, NOFOLLOW">` and no title — so we reported "no
+// <title>", "noindex", "no rel=canonical" and "no meta description" against a homepage that
+// has all four. Same class as inventing a 404: four confidently wrong findings, and the
+// noindex one would send an owner hunting for a tag that is not in their template.
+// Both conditions are required. A real page can carry the word "challenge-platform" in an
+// analytics snippet; a real page is not 2KB long. Length is what keeps this from firing on
+// genuine content.
+const BOT_WALL = /_Incapsula_Resource|\/cdn-cgi\/challenge-platform|cf-browser-verification|Checking your browser|Just a moment\.\.\.|Attention Required! \| Cloudflare|_pxhc|\/akam\/|DataDome/i;
+export const isBotWall = body =>
+  typeof body === 'string' && body.length < 2048 && BOT_WALL.test(body);
+
 // HTML5 allows unquoted attribute values and real sites ship them: ghost.org serves
 // `<link rel="canonical" href=https://ghost.org/about/>`, so a quotes-only regex reported
 // "no rel=canonical" on six pages that all had one. Telling a paying customer to add a tag
@@ -521,7 +534,9 @@ async function check(base, { limit, json }) {
     // an SPA shell served with 200 for /sitemap.xml, or a .gz we could not decompress.
     if (!urls.length) fail(/<(urlset|sitemapindex)[\s>]/i.test(smRes.body)
       ? `sitemap ${sitemapUrl} lists no <loc> entries`
-      : `sitemap ${sitemapUrl} returned 200 but the body is not a readable sitemap`);
+      : isBotWall(smRes.body)
+        ? `sitemap ${sitemapUrl} returned 200 but served a bot-protection page, not a sitemap — allow this checker through your WAF, or the crawlers it stands in for are seeing the same wall`
+        : `sitemap ${sitemapUrl} returned 200 but the body is not a readable sitemap`);
     const foreign = urls.filter(u => { try { return new URL(u).origin !== origin; } catch { return true; } });
     if (foreign.length) fail(`sitemap lists ${foreign.length} URL(s) off-origin, e.g. ${foreign[0]}`);
   }
@@ -569,6 +584,13 @@ async function check(base, { limit, json }) {
       // cannot be a search result at all (text/xml, text/markdown, a stray JSON feed).
       if (isIndexableDoc(res.type)) return { url, finalUrl, status: res.status, problems: [] };
       const p = `not an HTML page (${res.type.split(';')[0] || 'unknown type'}) — remove it from the sitemap`;
+      failInline(`${url}${via} — ${p}`);
+      return { url, finalUrl, status: res.status, problems: [p] };
+    }
+    // A bot wall behind a 200 has none of the tags we look for, so checkHtml would report the
+    // WAF's shim as the owner's page. Say what actually happened instead.
+    if (isBotWall(res.body)) {
+      const p = 'served a bot-protection page (HTTP 200), so this page could not be checked';
       failInline(`${url}${via} — ${p}`);
       return { url, finalUrl, status: res.status, problems: [p] };
     }
@@ -969,6 +991,20 @@ async function selftest() {
   assert(!isIndexableDoc('text/xml; charset=utf-8') && !isIndexableDoc('text/markdown')
     && !isIndexableDoc('application/json') && !isIndexableDoc('') && !isIndexableDoc(null),
     'XML/markdown/JSON/unknown in a page sitemap are still flagged');
+
+  // The real silverstripe.org body, trimmed: 200 OK, noindex, no title, no canonical.
+  assert(isBotWall('<html><head><META NAME="ROBOTS" CONTENT="NOINDEX, NOFOLLOW">'
+    + '<script src="/_Incapsula_Resource?SWJIYLWA=5074a744"></script></head><body></body></html>'),
+    'an Incapsula 200 shim is a bot wall, not a page with four missing tags');
+  assert(isBotWall('<html><head><title>Just a moment...</title>'
+    + '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate/jsch/v1"></script></head></html>'),
+    'a Cloudflare challenge is a bot wall');
+  assert(!isBotWall('<html><head><title>Real page</title></head><body>'
+    + 'x'.repeat(3000) + '<script src="/cdn-cgi/challenge-platform/x.js"></script></body></html>'),
+    'a full-length page is never a bot wall, even if it mentions a challenge script');
+  assert(!isBotWall('<html><head><title>Tiny but real</title></head><body>hi</body></html>')
+    && !isBotWall('') && !isBotWall(null) && !isBotWall(undefined),
+    'a short ordinary page, an empty body and a missing body are not bot walls');
 
   const seeded = seedFromHome('<a href="/">home</a><a href="/a">1</a><a href="https://x.com/b">2</a>', 'https://a.com');
   assert(seeded.join(',') === 'https://a.com/,https://a.com/a', 'seedFromHome leads with home, dedupes it, drops off-origin');
