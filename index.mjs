@@ -112,7 +112,10 @@ export function pickSitemap(sitemaps, origin) {
   return (exact || sibling)?.s || sitemaps[0] || null;
 }
 
-export function parseRobots(txt) {
+// `base` is the robots.txt URL. The spec says a Sitemap: line must be absolute, but real
+// sites write `Sitemap: /sitemap.xml` (october.com does) — resolving it is the difference
+// between reading their sitemap and throwing ERR_INVALID_URL at it.
+export function parseRobots(txt, base) {
   const lines = txt.split('\n').map(l => l.replace(/#.*/, '').trim()).filter(Boolean);
   const sitemaps = [];
   let star = false, blocksAll = false;
@@ -120,7 +123,11 @@ export function parseRobots(txt) {
     const [rawKey, ...rest] = line.split(':');
     const key = rawKey.toLowerCase().trim();
     const value = rest.join(':').trim();
-    if (key === 'sitemap') sitemaps.push(value);
+    if (key === 'sitemap' && value) {
+      let resolved = value;
+      if (base) try { resolved = new URL(value, base).href; } catch { /* keep it raw; pickSitemap already tolerates junk */ }
+      sitemaps.push(resolved);
+    }
     else if (key === 'user-agent') star = value === '*';
     else if (key === 'disallow' && star && value === '/') blocksAll = true;
   }
@@ -524,7 +531,7 @@ async function check(base, { limit, json }) {
   if (robotsRes.status !== 200) {
     fail(`robots.txt ${statusProblem(robotsRes)}`);
   } else {
-    const { sitemaps, blocksAll } = parseRobots(robotsRes.body);
+    const { sitemaps, blocksAll } = parseRobots(robotsRes.body, robotsRes.url || origin + '/robots.txt');
     if (blocksAll) fail('robots.txt disallows / for all crawlers — nothing will be indexed');
     if (!sitemaps.length) fail('robots.txt declares no Sitemap:');
     sitemapUrls = sitemaps;
@@ -814,6 +821,12 @@ async function selftest() {
   assert(r.blocksAll && r.sitemaps[0] === 'https://a.com/sitemap.xml', 'parseRobots blocking');
   assert(!parseRobots('User-agent: *\nAllow: /\nDisallow: /admin/').blocksAll, 'parseRobots allowing');
   assert(!parseRobots('User-agent: badbot\nDisallow: /').blocksAll, 'parseRobots per-agent block is not site-wide');
+  assert(parseRobots('Sitemap: /sitemap.xml', 'https://a.com/robots.txt').sitemaps[0] === 'https://a.com/sitemap.xml',
+    'a relative Sitemap: line resolves against robots.txt instead of throwing ERR_INVALID_URL');
+  assert(parseRobots('Sitemap: https://b.com/s.xml', 'https://a.com/robots.txt').sitemaps[0] === 'https://b.com/s.xml',
+    'an absolute Sitemap: line is unchanged by resolution');
+  assert(parseRobots('Sitemap: /sitemap.xml').sitemaps[0] === '/sitemap.xml',
+    'parseRobots without a base still returns the raw value');
 
   // Jetpack's real shape: index → index → urlset. One level of following returns XML files.
   const index = locs => `<sitemapindex>${locs.map(l => `<loc>${l}</loc>`).join('')}</sitemapindex>`;
