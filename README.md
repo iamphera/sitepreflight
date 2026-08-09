@@ -1,6 +1,6 @@
 # sitepreflight
 
-Pre-flight checks for a static site, then tell the search engines. One file, zero dependencies, Node 18+.
+Point it at a URL and it tells you what your last deploy broke. No config file, no install, and no access to your repo — so it also works on a site you do not own. One file, zero dependencies, Node 18+.
 
 It catches the boring things that quietly cost you traffic after a deploy:
 
