@@ -185,6 +185,15 @@ const BOT_WALL = /_Incapsula_Resource|\/cdn-cgi\/challenge-platform|cf-browser-v
 export const isBotWall = body =>
   typeof body === 'string' && body.length < 2048 && BOT_WALL.test(body);
 
+// The length guard above is what stops BOT_WALL firing on real content, and it is also what
+// makes the body heuristic miss: Cloudflare's current managed challenge is 5412 bytes, so
+// support.discord.com's interstitial sails past it. Cloudflare states the fact in a header
+// instead — `cf-mitigated: challenge` is set only when Cloudflare itself blocked the request,
+// so there is no false positive to trade against and no length to tune. Without it we printed
+// "returned 403" against six live Zendesk help-centre pages: six invented page defects, the
+// same credibility failure as a fabricated 404.
+export const isChallenged = res => (res && res.mitigated) === 'challenge';
+
 // HTML5 allows unquoted attribute values and real sites ship them: ghost.org serves
 // `<link rel="canonical" href=https://ghost.org/about/>`, so a quotes-only regex reported
 // "no rel=canonical" on six pages that all had one. Telling a paying customer to add a tag
@@ -463,6 +472,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 // limiting, not six broken pages. Name which it is, or the owner hunts a defect that is not
 // there — the same credibility failure as a fabricated 404.
 export const statusProblem = res => `returned ${res.status || res.error}`
+  + (isChallenged(res) ? ' — blocked by a bot-protection challenge, not a page defect' : '')
   + (isThrottled(res.status) ? ' — rate limited, not necessarily a page defect' : '');
 
 async function get(url, method = 'GET', attempt = 0) {
@@ -481,7 +491,8 @@ async function get(url, method = 'GET', attempt = 0) {
     const body = method === 'GET'
       ? decodeBody(await res.arrayBuffer(), res.headers.get('content-type'))
       : '';
-    return { status: res.status, body, url: res.url, type: res.headers.get('content-type') || '' };
+    return { status: res.status, body, url: res.url, type: res.headers.get('content-type') || '',
+      mitigated: res.headers.get('cf-mitigated') || '' };
   } catch (err) {
     const cause = bestCause(err);
     return { status: 0, body: '', url, type: '', error: fetchErrorReason(err), code: cause.code || '' };
@@ -587,7 +598,7 @@ async function check(base, { limit, json }) {
     const home = await get(origin + '/');
     // g2.com answers 403 to both its sitemap and its homepage (bot protection), which left
     // nothing at all to check — say that outright instead of shipping a bare issue count.
-    if (home.status !== 200) fail(`${origin}/ → ${home.status || home.error} — no sitemap and no readable homepage, so no pages could be checked`);
+    if (home.status !== 200) fail(`${origin}/ ${statusProblem(home)} — no sitemap and no readable homepage, so no pages could be checked`);
     else {
       urls = seedFromHome(home.body, origin);
       report.crawledFromHome = true;
@@ -1071,6 +1082,16 @@ async function selftest() {
   assert(!isBotWall('<html><head><title>Tiny but real</title></head><body>hi</body></html>')
     && !isBotWall('') && !isBotWall(null) && !isBotWall(undefined),
     'a short ordinary page, an empty body and a missing body are not bot walls');
+
+  // The real support.discord.com response: 403 with a 5412-byte body, so the length guard in
+  // isBotWall cannot see it and the 403 never reached that check anyway.
+  assert(statusProblem({ status: 403, mitigated: 'challenge' })
+    === 'returned 403 — blocked by a bot-protection challenge, not a page defect',
+    'a Cloudflare-challenged 403 is named as a wall, not as a page defect');
+  assert(statusProblem({ status: 404, mitigated: '' }) === 'returned 404'
+    && statusProblem({ status: 0, error: 'timed out' }) === 'returned timed out'
+    && !isChallenged({ status: 403 }) && !isChallenged(undefined),
+    'an ordinary failure is unchanged — no challenge wording bolted onto a real 404');
 
   const seeded = seedFromHome('<a href="/">home</a><a href="/a">1</a><a href="https://x.com/b">2</a>', 'https://a.com');
   assert(seeded.join(',') === 'https://a.com/,https://a.com/a', 'seedFromHome leads with home, dedupes it, drops off-origin');
