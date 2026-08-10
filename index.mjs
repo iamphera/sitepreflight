@@ -652,7 +652,11 @@ async function check(base, { limit, json }) {
   // Internal links that the sitemap never mentions are the usual source of dead ends.
   const known = new Set(urls.map(normalise));
   const unlisted = [...linkTargets].filter(l => !known.has(normalise(l)));
-  const checked = (await mapLimit(unlisted.slice(0, limit), 6, async l => {
+  // --limit caps the link probes too, and it always has. Saying "49 extra internal links"
+  // when only 6 were fetched tells a paying reader the other 43 came back clean. Count what
+  // was actually checked, separately from what was found.
+  const probed = unlisted.slice(0, limit);
+  const checked = (await mapLimit(probed, 6, async l => {
     const res = await linkStatus(l);
     // wagtail.org/slack is a redirect to join.slack.com, which 403s every non-browser. Saying
     // only "wagtail.org/slack → 403" sends the owner to look at their own server for a fault
@@ -672,15 +676,19 @@ async function check(base, { limit, json }) {
   for (const b of broken) failInline(`internal link ${b.url}${b.finalUrl ? ` (redirected to ${b.finalUrl})` : ''} → ${b.status || b.error}`);
   report.brokenLinks = broken;
   report.unverifiedLinks = unverified;
+  report.links = { found: unlisted.length, checked: probed.length };
 
   console.log(json ? JSON.stringify(report, null, 2)
-                   : renderText(report, inline, unlisted.length));
+                   : renderText(report, inline, report.links));
   return report.issues.length ? 1 : 0;
 }
 
 // This text IS what a paying subscriber receives by email, so every issue counted in the
 // summary line must also be spelled out above it.
-function renderText(report, inline, unlistedCount) {
+function renderText(report, inline, links) {
+  const linkLine = links.checked < links.found
+    ? `${links.checked} of ${links.found} extra internal links (${links.found - links.checked} not checked — raise --limit)`
+    : `${links.found} extra internal links`;
   const siteIssues = report.issues.filter(m => !inline.has(m));
   const out = [
     ``,
@@ -688,7 +696,7 @@ function renderText(report, inline, unlistedCount) {
     report.crawledFromHome
       ? `  no usable sitemap — crawled from the homepage instead`
       : `  sitemap: ${report.sitemap.count} URLs (${report.sitemap.url})`,
-    `  checked: ${report.pages.length} pages, ${unlistedCount} extra internal links`,
+    `  checked: ${report.pages.length} pages, ${linkLine}`,
     ``,
   ];
   for (const m of siteIssues) out.push(`  ✗ ${m}`);
@@ -1083,7 +1091,7 @@ async function selftest() {
   const crawlText = renderText({
     site: 'https://a.com', sitemap: { url: 'https://a.com/sitemap.xml', count: 0 }, crawledFromHome: true,
     pages: [{ url: 'https://a.com/', problems: [] }], brokenLinks: [], issues: ['sitemap https://a.com/sitemap.xml returned 404'],
-  }, new Set(), 0);
+  }, new Set(), { found: 0, checked: 0 });
   assert(crawlText.includes('crawled from the homepage'), 'fallback crawl is disclosed in the report');
   assert(crawlText.includes('https://a.com/'), 'fallback crawl still lists the pages it checked');
 
@@ -1094,7 +1102,7 @@ async function selftest() {
     pages: [], brokenLinks: [],
     issues: ['robots.txt returned 404', 'sitemap https://a.com/sitemap.xml returned 404'],
   };
-  const text = renderText(siteOnly, new Set(), 0);
+  const text = renderText(siteOnly, new Set(), { found: 0, checked: 0 });
   assert(siteOnly.issues.every(m => text.includes(m)), 'site-level issues are printed, not just counted');
   assert(text.includes('2 issue(s) found'), 'issue count still summarised');
 
@@ -1108,11 +1116,19 @@ async function selftest() {
              'https://a.com/p — no <title>'],
   };
   const pageIssue = 'https://a.com/p — no <title>';
-  const lateText = renderText(late, new Set([pageIssue]), 0);
+  const lateText = renderText(late, new Set([pageIssue]), { found: 0, checked: 0 });
   assert(late.issues.filter(m => m !== pageIssue).every(m => lateText.includes(m)),
     'every counted issue that is not shown inline is printed verbatim');
   assert(lateText.includes('https://a.com/ → 403'), 'an issue raised after the sitemap stage is still printed');
   assert(lateText.split('no <title>').length === 2, 'an issue shown next to its page is not printed twice');
+
+  // meta.discourse.org found 49 unlisted internal links at --limit 6; the summary said "49
+  // extra internal links", which reads as 49 fetched and clean. 43 were never touched.
+  const capped = renderText(siteOnly, new Set(), { found: 49, checked: 6 });
+  assert(capped.includes('6 of 49 extra internal links') && capped.includes('43 not checked'),
+    'a --limit-truncated link probe says how many links it skipped');
+  assert(!renderText(siteOnly, new Set(), { found: 6, checked: 6 }).includes('not checked'),
+    'no truncation notice when every found link was probed');
 
   // A gzipped sitemap is legal and g2.com serves one; unwrapped, the XML parse finds no
   // <loc>s and we would report a perfectly good sitemap as empty.
