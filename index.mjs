@@ -226,6 +226,7 @@ function tagsWhere(html, name, attr, value) {
 
 export function checkHtml(html, url) {
   const problems = [];
+  let offCanonical = null;
   const pick = re => (html.match(re) || [])[1];
   const meta = n => attrValue(tagsWhere(html, 'meta', 'name', n)[0] || '', 'content');
 
@@ -247,7 +248,12 @@ export function checkHtml(html, url) {
   const canonical = attrValue(canonTag || '', 'href');
   if (!canonTag) problems.push('no rel=canonical');
   else if (!canonical || !canonical.trim()) problems.push('rel=canonical has an empty href');
-  else if (normalise(canonical) !== normalise(url)) problems.push(`canonical points elsewhere (${canonical})`);
+  else if (normalise(canonical) !== normalise(url)) {
+    problems.push(`canonical points elsewhere (${canonical})`);
+    // Handed back so the caller can fetch it: a canonical is only a defect worth escalating
+    // when the URL it names is dead, and that needs a request checkHtml must not make.
+    try { offCanonical = new URL(canonical, url).toString(); } catch { /* unparseable, nothing to fetch */ }
+  }
 
   const descTag = tagsWhere(html, 'meta', 'name', 'description')[0];
   const desc = attrValue(descTag || '', 'content');
@@ -257,7 +263,7 @@ export function checkHtml(html, url) {
   const mojibake = findMojibake(html);
   if (mojibake.length) problems.push(`mojibake: ${mojibake.slice(0, 4).join(' ')}`);
 
-  return { title, problems };
+  return { title, problems, offCanonical };
 }
 
 export function hasPath(u) {
@@ -645,13 +651,32 @@ async function check(base, { limit, json }) {
       return { url, finalUrl, status: res.status, problems: [p] };
     }
     // res.url, not url: the canonical and the internal links belong to the page we landed on.
-    const { title, problems } = checkHtml(res.body, res.url || url);
+    const { title, problems, offCanonical } = checkHtml(res.body, res.url || url);
     const rootHop = redirectedToRoot(url, finalUrl);
     if (rootHop) problems.unshift(rootHop);
     for (const l of internalLinks(res.body, res.url || url)) linkTargets.add(l);
     for (const p of problems) failInline(`${url}${via} — ${p}`);
-    return { url, finalUrl, status: res.status, title, problems };
+    return { url, finalUrl, status: res.status, title, problems, via, offCanonical };
   });
+
+  // A canonical naming a URL that does not resolve is the worst defect this tool can find:
+  // the page is live, and it is telling Google to index a dead address instead, so it drops
+  // out of the index entirely. tilda.cc/privacy/ does exactly this — canonical
+  // https://tilda.cc/page48634835.html, which returns 404. "Points elsewhere" alone reads as
+  // a style note, so the dead target has to be stated as its own finding.
+  const canonPages = report.pages.filter(p => p.offCanonical);
+  await mapLimit(canonPages, 6, async p => {
+    const res = await linkStatus(p.offCanonical);
+    // Same restraint as the internal-link probe: a throttle, a bot challenge, or a fault on
+    // our own network is not evidence the target is dead, and a fabricated finding of this
+    // severity ("your page is invisible to Google") is the worst thing we could ship.
+    if (isThrottled(res.status) || isChallenged(res) || isOurNetwork(res)) return;
+    if (res.status > 0 && res.status < 400) return;
+    const msg = `canonical target ${p.offCanonical} ${statusProblem(res)} — this page tells search engines to index a URL that does not work`;
+    p.problems.push(msg);
+    failInline(`${p.url}${p.via} — ${msg}`);
+  });
+  for (const p of report.pages) { delete p.via; delete p.offCanonical; }
 
   // Judging a page where it landed closes the false "canonical points elsewhere", but it
   // opens a worse hole: a sitemap whose URLs all 302 to one surviving page now self-canonicals
@@ -974,6 +999,20 @@ async function selftest() {
     'a description tag with no content attribute is empty, not missing');
   assert(checkHtml(good.replace(' href="https://a.com/p/"', ''), 'https://a.com/p/').problems[0].includes('empty href'),
     'a canonical tag with no href attribute is empty, not missing');
+
+  // An off-page canonical is handed back so check() can fetch it (the tilda.cc case: a live
+  // page canonicalising to a URL that 404s). A self-canonical must NOT trigger a probe, or
+  // every healthy page on the site costs an extra request.
+  assert(checkHtml(good, 'https://a.com/other/').offCanonical === 'https://a.com/p/',
+    'an off-page canonical is returned as an absolute URL to probe');
+  assert(checkHtml(good, 'https://a.com/p/').offCanonical === null,
+    'a self-canonical is never probed');
+  assert(checkHtml(`<title>T</title><meta name="description" content="d">
+    <link rel="canonical" href="/elsewhere/">`, 'https://a.com/p/').offCanonical === 'https://a.com/elsewhere/',
+    'a relative canonical is resolved against the page before probing');
+  const badCanon = checkHtml(good.replace('href="https://a.com/p/"', 'href="http://[bad"'), 'https://a.com/p/');
+  assert(badCanon.offCanonical === null && badCanon.problems.some(p => p.includes('points elsewhere')),
+    'an unparseable canonical is reported as a mismatch but never probed');
 
   // A redirected page is judged where it landed (drupal.org → new.drupal.org).
   assert(redirectedTo('https://a.com/p', { url: 'https://b.com/p' }) === 'https://b.com/p',

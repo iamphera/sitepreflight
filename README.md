@@ -9,7 +9,7 @@ It catches the boring things that quietly cost you traffic after a deploy:
 - pages that return anything other than 200
 - missing `<title>` or meta description
 - `noindex` left on a page you meant to publish
-- `rel=canonical` missing, or pointing at a different URL
+- `rel=canonical` missing, or pointing at a different URL — and if it points elsewhere, whether that URL is even alive (a live page canonicalising to a 404 drops out of the index)
 - sitemap URLs that redirect to the homepage — dead pages Google files under "page with redirect"
 - mojibake (`cafÃ©`) from a bad encoding round-trip
 
